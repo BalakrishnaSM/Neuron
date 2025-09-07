@@ -19,9 +19,9 @@ const BrowserRouter = createBrowserRouter(paths);
 
 const App = () => {
     return (
-    <MantineProvider>
-      <RouterProvider router={BrowserRouter}/>
-    </MantineProvider>
+  <MantineProvider defaultColorScheme="dark">
+        <RouterProvider router={BrowserRouter}/>
+      </MantineProvider>
     )
 };
 
