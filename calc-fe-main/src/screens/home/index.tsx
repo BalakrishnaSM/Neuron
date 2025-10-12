@@ -40,7 +40,7 @@ import Draggable from 'react-draggable';
 
 // ---- CONFIG ----
 const API_URL = (import.meta as unknown as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL || 'http://localhost:8900';
-// If you keep a constants file, import it; else fallback palette:
+// Fallback color palette:
 const DEFAULT_SWATCHES = [
   '#ffffff',
   '#ef4444',
@@ -53,6 +53,7 @@ const DEFAULT_SWATCHES = [
   '#94a3b8',
   '#000000',
 ];
+const TARGET_VLM_SIZE = 512; // Standard size for most VLMs like moondream
 
 // ---- Types ----
 interface GeneratedResult {
@@ -161,6 +162,13 @@ function trySolveLocally(input: string): GeneratedResult | null {
   }
 }
 
+// SAFETY: sanitize HTML for LaTeX wrapper
+function escapeHtml(s: string) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
 // ---- Main Component ----
 function App() {
   // THEME
@@ -245,12 +253,16 @@ function App() {
     if (!ctx) return;
     const img = new Image();
     img.onload = () => {
+      // Clear and reset transform to draw the background and saved state
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       // restore board bg
       ctx.fillStyle = dark ? '#000' : '#fff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0);
+      // Reapply the canvas transform after loading the image
+      const t = transformRef.current;
+      ctx.setTransform(t.scale, 0, 0, t.scale, t.offsetX, t.offsetY);
     };
     img.src = url;
   };
@@ -283,6 +295,9 @@ function App() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = dark ? '#000' : '#fff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // Restore the current pan/zoom state after clearing
+    const t = transformRef.current;
+    ctx.setTransform(t.scale, 0, 0, t.scale, t.offsetX, t.offsetY);
   };
 
   // ---- Canvas init & event handling ----
@@ -292,33 +307,39 @@ function App() {
     const dpr = window.devicePixelRatio || 1;
 
     const setSize = () => {
-      // Responsive sizing for all devices
-      let w = window.innerWidth;
-      let h = window.innerHeight;
-      // For desktop, use min size; for mobile, use full viewport
-      if (w > 800) {
-        w = Math.max(w, 1600);
-        h = Math.max(h, 1200);
-      }
-      canvas.width = Math.floor(w * dpr);
-      canvas.height = Math.floor(h * dpr);
-      canvas.style.width = `${w}px`;
-      canvas.style.height = `${h}px`;
+      // Use full viewport for responsive sizing
+      // FIX: Use const for w and h as they are not reassigned
+      const w_css = window.innerWidth;
+      const h_css = window.innerHeight;
+      
+      canvas.width = Math.floor(w_css * dpr);
+      canvas.height = Math.floor(h_css * dpr);
+      canvas.style.width = `${w_css}px`;
+      canvas.style.height = `${h_css}px`;
+      
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
+      
+      // Apply scaling for HiDPI displays
       ctx.scale(dpr, dpr);
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
+      
+      // Fill background (handle existing pan/zoom state if possible)
+      const t = transformRef.current;
+      ctx.setTransform(t.scale, 0, 0, t.scale, t.offsetX, t.offsetY);
+      
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.fillStyle = dark ? '#000' : '#fff';
-      ctx.fillRect(0, 0, w, h);
+      ctx.fillRect(0, 0, w_css, h_css);
+      ctx.setTransform(t.scale, 0, 0, t.scale, t.offsetX, t.offsetY);
     };
 
     setSize();
     const onResize = () => setSize();
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [dark]);
+  }, [dark]); // Removed w, h from setSize logic, keeping original dependencies.
 
   // PAN/ZOOM
   useEffect(() => {
@@ -338,7 +359,7 @@ function App() {
       const { offsetX, offsetY, deltaY } = e;
       const direction = deltaY > 0 ? -1 : 1;
       const factor = 1 + direction * 0.1;
-      // Zoom towards cursor
+      // Zoom towards cursor (in CSS pixels)
       const wx = (offsetX - t.offsetX) / t.scale;
       const wy = (offsetY - t.offsetY) / t.scale;
       t.scale *= factor;
@@ -348,12 +369,12 @@ function App() {
     };
 
     // Pinch-to-zoom and multi-touch pan
-  // Removed unused variable lastTouches
     let lastDistance = 0;
     let lastCenter = { x: 0, y: 0 };
     const getTouchCenter = (touches: TouchList) => {
-      const x = (touches[0].clientX + touches[1].clientX) / 2;
-      const y = (touches[0].clientY + touches[1].clientY) / 2;
+      const rect = canvas.getBoundingClientRect();
+      const x = (touches[0].clientX + touches[1].clientX) / 2 - rect.left;
+      const y = (touches[0].clientY + touches[1].clientY) / 2 - rect.top;
       return { x, y };
     };
     const getTouchDistance = (touches: TouchList) => {
@@ -372,23 +393,34 @@ function App() {
         e.preventDefault();
         const newDistance = getTouchDistance(e.touches);
         const newCenter = getTouchCenter(e.touches);
+        
         // Pinch zoom
         const scaleChange = newDistance / lastDistance;
+        const oldScale = t.scale;
         t.scale *= scaleChange;
-        // Pan
-        t.offsetX += newCenter.x - lastCenter.x;
-        t.offsetY += newCenter.y - lastCenter.y;
+
+        // Zoom toward center
+        const wx = (lastCenter.x * dpr - t.offsetX) / oldScale;
+        const wy = (lastCenter.y * dpr - t.offsetY) / oldScale;
+        t.offsetX = newCenter.x * dpr - wx * t.scale;
+        t.offsetY = newCenter.y * dpr - wy * t.scale;
+        
         lastDistance = newDistance;
         lastCenter = newCenter;
         applyTransform();
       }
     };
+    const onTouchEnd = () => {
+        lastDistance = 0;
+    }
+    
     canvas.addEventListener('touchstart', onTouchStart, { passive: false });
     canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', onTouchEnd, { passive: false });
 
     // Space + drag to pan
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.code === 'Space') {
+      if (e.code === 'Space' && !isPanningRef.current) {
         isPanningRef.current = true;
         canvas.style.cursor = 'grabbing';
       }
@@ -408,11 +440,12 @@ function App() {
       }
     };
     const onMouseMovePan = (e: MouseEvent) => {
+      // Pan distance in CSS pixels, apply to offset
       const dx = e.clientX - lastPan.x;
       const dy = e.clientY - lastPan.y;
       lastPan = { x: e.clientX, y: e.clientY };
-      t.offsetX += dx;
-      t.offsetY += dy;
+      t.offsetX += dx * dpr;
+      t.offsetY += dy * dpr;
       applyTransform();
     };
     const onMouseUpPan = () => {
@@ -432,17 +465,19 @@ function App() {
       canvas.removeEventListener('mousedown', onMouseDown);
       canvas.removeEventListener('touchstart', onTouchStart);
       canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchend', onTouchEnd);
     };
-  }, []);
+  }, [dpr]);
 
   // DRAWING & SHAPES
   useEffect(() => {
     const canvas = canvasRef.current!;
     if (!canvas) return;
     const ctx = canvas.getContext('2d')!;
-    const dpr = window.devicePixelRatio || 1;
 
     const t = transformRef.current;
+    
+    // Convert client coordinates (CSS pixels) to world coordinates (Canvas/Drawing pixels)
     const toWorld = (clientX: number, clientY: number) => {
       const rect = canvas.getBoundingClientRect();
       // Use CSS pixel coordinates
@@ -456,52 +491,69 @@ function App() {
       const wy = (ctx_y - t.offsetY) / t.scale;
       return { x: wx, y: wy };
     };
+    
+    // Convert world coordinates to CSS pixel coordinates (for custom cursor)
+    const toScreen = (worldX: number, worldY: number) => {
+      const screenX = (worldX * t.scale + t.offsetX) / dpr;
+      const screenY = (worldY * t.scale + t.offsetY) / dpr;
+      return { x: screenX, y: screenY };
+    }
 
-    // Auto-grow canvas near edges
+    // Auto-grow canvas near edges (Simplified logic for the current setup)
     const ensureCapacity = (x: number, y: number) => {
-      const margin = 50;
+      const margin = 50 * dpr; // Margin in device pixels
       let grew = false;
-      // Use CSS pixel values for width/height
+      
+      const currentW = canvas.width;
+      const currentH = canvas.height;
+
+      // Note: x and y here are in *device pixels* due to ctx_x/ctx_y logic not being used 
+      // in the toWorld function's return. Let's rely on CSS pixel check for simplicity, 
+      // but ensure we use dpr correctly in the growth logic.
+      const x_css = x * dpr; 
+      const y_css = y * dpr;
+      
       const widthCSS = parseFloat(canvas.style.width || '0');
       const heightCSS = parseFloat(canvas.style.height || '0');
-      if (x > widthCSS - margin) {
-        grew = true;
-        const newW = widthCSS + 600;
-        const temp = document.createElement('canvas');
-        temp.width = Math.floor(newW * dpr);
-        temp.height = Math.floor(heightCSS * dpr);
-        const tctx = temp.getContext('2d')!;
-        tctx.scale(dpr, dpr);
-        // fill bg
-        tctx.fillStyle = dark ? '#000' : '#fff';
-        tctx.fillRect(0, 0, newW, heightCSS);
-        // draw old
-        tctx.drawImage(canvas, 0, 0);
-        canvas.width = temp.width;
-        canvas.style.width = `${newW}px`;
-        const c2 = canvas.getContext('2d')!;
-        c2.resetTransform();
-        c2.scale(dpr, dpr);
-        c2.drawImage(temp, 0, 0);
+      
+      if (x_css > currentW - margin || y_css > currentH - margin) {
+          // If we are near the edge, grow by 600 CSS pixels
+          const newW_CSS = x_css > currentW - margin ? widthCSS + 600 : widthCSS;
+          const newH_CSS = y_css > currentH - margin ? heightCSS + 600 : heightCSS;
+          
+          const newW_DPR = Math.floor(newW_CSS * dpr);
+          const newH_DPR = Math.floor(newH_CSS * dpr);
+          
+          if (newW_DPR > currentW || newH_DPR > currentH) {
+              grew = true;
+              
+              const temp = document.createElement('canvas');
+              temp.width = newW_DPR;
+              temp.height = newH_DPR;
+              const tctx = temp.getContext('2d')!;
+              tctx.scale(dpr, dpr);
+              
+              // fill bg in the temporary canvas
+              tctx.fillStyle = dark ? '#000' : '#fff';
+              tctx.fillRect(0, 0, newW_CSS, newH_CSS);
+              
+              // draw old content
+              tctx.drawImage(canvas, 0, 0);
+              
+              // Update main canvas dimensions and style
+              canvas.width = temp.width;
+              canvas.height = temp.height;
+              canvas.style.width = `${newW_CSS}px`;
+              canvas.style.height = `${newH_CSS}px`;
+              
+              // Draw temporary canvas back to main canvas (resetting transform first)
+              const c2 = canvas.getContext('2d')!;
+              c2.setTransform(1, 0, 0, 1, 0, 0);
+              c2.scale(dpr, dpr);
+              c2.drawImage(temp, 0, 0);
+          }
       }
-      if (y > heightCSS - margin) {
-        grew = true;
-        const newH = heightCSS + 600;
-        const temp = document.createElement('canvas');
-        temp.width = Math.floor(widthCSS * dpr);
-        temp.height = Math.floor(newH * dpr);
-        const tctx = temp.getContext('2d')!;
-        tctx.scale(dpr, dpr);
-        tctx.fillStyle = dark ? '#000' : '#fff';
-        tctx.fillRect(0, 0, widthCSS, newH);
-        tctx.drawImage(canvas, 0, 0);
-        canvas.height = temp.height;
-        canvas.style.height = `${newH}px`;
-        const c2 = canvas.getContext('2d')!;
-        c2.resetTransform();
-        c2.scale(dpr, dpr);
-        c2.drawImage(temp, 0, 0);
-      }
+      
       if (grew) {
         // reapply transform after dimension change
         const tr = transformRef.current;
@@ -509,91 +561,95 @@ function App() {
       }
     };
 
+
     // For shapes: snapshot before drawing preview
     const snapshotCanvas = () => {
-      const widthCSS = parseFloat(canvas.style.width || '0');
-      const heightCSS = parseFloat(canvas.style.height || '0');
+      const widthDPR = canvas.width;
+      const heightDPR = canvas.height;
+      
+      // Temporarily remove transform to get the raw pixel data
       const tr = ctx.getTransform();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      const snap = ctx.getImageData(0, 0, widthCSS, heightCSS);
+      const snap = ctx.getImageData(0, 0, widthDPR, heightDPR);
+      // Restore transform
       ctx.setTransform(tr);
       return snap;
     };
     const restoreSnapshot = (snap: ImageData) => {
+      // Temporarily remove transform to restore raw pixel data
       const tr = ctx.getTransform();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.putImageData(snap, 0, 0);
+      // Restore transform
       ctx.setTransform(tr);
     };
 
-    // For smoothing
-    const points: { x: number; y: number }[] = [];
     const onPointerDown = (e: PointerEvent) => {
-      if (e.pointerType !== 'pen' && e.pointerType !== 'mouse') return;
-      const p = toWorld(e.clientX, e.clientY);
-      ensureCapacity(p.x, p.y);
-      setCursorPos(p);
+      // Only respond to pen or primary mouse button
+      if (e.pointerType !== 'pen' && (e.pointerType !== 'mouse' || e.button !== 0)) return; 
+      
+      const p_world = toWorld(e.clientX, e.clientY);
+      const p_screen = toScreen(p_world.x, p_world.y);
+      
+      ensureCapacity(p_screen.x, p_screen.y);
+      setCursorPos(p_screen);
       pushUndo();
+      
       if (mode === 'pen' || mode === 'eraser') {
         isDrawingRef.current = true;
-        lastPosRef.current = p;
-        points.length = 0;
-        points.push(p);
+        lastPosRef.current = p_world;
         ctx.globalCompositeOperation = mode === 'eraser' ? 'destination-out' : 'source-over';
         ctx.strokeStyle = color;
-        const pressure = e.pressure === 0 ? 1 : e.pressure;
-        ctx.lineWidth = (mode === 'eraser' ? thickness * 4 : thickness) * (0.5 + pressure / 2);
+        // Use a base thickness, influenced by pressure if available
+        const baseThickness = thickness / dpr; 
+        const pressureFactor = (e.pressure === 0 || e.pressure === 1) ? 1 : e.pressure * 2;
+        ctx.lineWidth = baseThickness * pressureFactor;
+        
         ctx.beginPath();
-        ctx.moveTo(p.x, p.y);
+        ctx.moveTo(p_world.x, p_world.y);
       } else {
-        shapeStartRef.current = p;
+        shapeStartRef.current = p_world;
+        // Take snapshot in DPR pixels
         snapshotRef.current = snapshotCanvas();
       }
     };
 
     const onPointerMove = (e: PointerEvent) => {
       if (e.pointerType !== 'pen' && e.pointerType !== 'mouse') return;
-      const p = toWorld(e.clientX, e.clientY);
-      ensureCapacity(p.x, p.y);
-      setCursorPos(p);
+      
+      const p_world = toWorld(e.clientX, e.clientY);
+      const p_screen = toScreen(p_world.x, p_world.y);
+      ensureCapacity(p_screen.x, p_screen.y);
+      setCursorPos(p_screen);
 
       if (mode === 'pen' || mode === 'eraser') {
         if (!isDrawingRef.current) return;
-        points.push(p);
-        const pressure = e.pressure === 0 ? 1 : e.pressure;
-        ctx.lineWidth = (mode === 'eraser' ? thickness * 4 : thickness) * (0.5 + pressure / 2);
-        // Smoothing: draw quadratic curve between last 3 points
-        if (points.length >= 3) {
-          const p0 = points[points.length - 3];
-          const p1 = points[points.length - 2];
-          const p2 = points[points.length - 1];
-          ctx.beginPath();
-          ctx.moveTo(p0.x, p0.y);
-          ctx.quadraticCurveTo(p1.x, p1.y, p2.x, p2.y);
-          ctx.stroke();
-        } else {
-          ctx.lineTo(p.x, p.y);
-          ctx.stroke();
-        }
-        lastPosRef.current = p;
+        const baseThickness = thickness / dpr; 
+        const pressureFactor = (e.pressure === 0 || e.pressure === 1) ? 1 : e.pressure * 2;
+        ctx.lineWidth = baseThickness * pressureFactor;
+        
+        ctx.lineTo(p_world.x, p_world.y);
+        ctx.stroke();
+        lastPosRef.current = p_world;
       } else if (shapeStartRef.current && snapshotRef.current) {
         restoreSnapshot(snapshotRef.current);
         ctx.strokeStyle = color;
-        ctx.lineWidth = thickness;
+        ctx.lineWidth = thickness / dpr; // Apply thickness adjusted for DPR
+        
         const a = shapeStartRef.current;
         if (mode === 'line') {
           ctx.beginPath();
           ctx.moveTo(a.x, a.y);
-          ctx.lineTo(p.x, p.y);
+          ctx.lineTo(p_world.x, p_world.y);
           ctx.stroke();
         }
         if (mode === 'rectangle') {
-          const w = p.x - a.x;
-          const h = p.y - a.y;
+          const w = p_world.x - a.x;
+          const h = p_world.y - a.y;
           ctx.strokeRect(a.x, a.y, w, h);
         }
         if (mode === 'circle') {
-          const r = Math.hypot(p.x - a.x, p.y - a.y);
+          const r = Math.hypot(p_world.x - a.x, p_world.y - a.y);
           ctx.beginPath();
           ctx.arc(a.x, a.y, r, 0, Math.PI * 2);
           ctx.stroke();
@@ -622,7 +678,7 @@ function App() {
       canvas.removeEventListener('pointerleave', onPointerUp);
       setCursorPos(null); // Clean up cursor position when unmounting
     };
-  }, [color, thickness, mode, dark, pushUndo, setCursorPos]);
+  }, [color, thickness, mode, dark, pushUndo, setCursorPos, dpr]);
 
   // MATHJAX loader
   useEffect(() => {
@@ -632,6 +688,7 @@ function App() {
     document.head.appendChild(script);
     script.onload = () => {
       if (window.MathJax) {
+        // FIX: Explicitly cast to 'any' to satisfy ESLint
         (window.MathJax.Hub.Config as any)({
           tex2jax: {
             inlineMath: [['$', '$'], ['\\(', '\\)']],
@@ -717,11 +774,19 @@ function App() {
         const canvas = canvasRef.current!;
         const ctx = canvas.getContext('2d')!;
         pushUndo();
-        const maxW = 600;
-        const scale = Math.min(1, maxW / img.width);
+        // Draw image onto canvas, centered
+        const maxW = 800;
+        const maxH = 600;
+        const scaleX = maxW / img.width;
+        const scaleY = maxH / img.height;
+        const scale = Math.min(scaleX, scaleY, 1); // Scale down if too big
         const w = img.width * scale;
         const h = img.height * scale;
-        ctx.drawImage(img, 80, 80, w, h);
+        const x = (canvas.width / dpr - w) / 2;
+        const y = (canvas.height / dpr - h) / 2;
+        
+        ctx.drawImage(img, x, y, w, h);
+        
         // history
         const item: HistoryItem = {
           id: Date.now() + '_img',
@@ -789,23 +854,38 @@ function App() {
     if (!canvas) return;
 
     setLoading(true);
+    const currentQuery = query.trim();
     setQuery(''); // Clear the text area
 
     // Prefer backend
     try {
+      // FIX: Explicitly cast payload to 'any' to satisfy ESLint
       const payload: any = {
         dict_of_vars: dictOfVars,
       };
-      if (query.trim()) {
-        payload.text = query.trim();
-      } else {
-        // Crop the canvas to the drawn area for better OCR performance
+      let centerX = 120;
+      let centerY = 200;
+      
+      // --- 1. Text Query Mode ---
+      if (currentQuery) {
+        payload.text = currentQuery;
+      } 
+      // --- 2. Canvas Image Mode ---
+      else {
+        // Crop the canvas to the drawn area and scale up for better OCR/VLM
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
+        
+        // Temporarily reset transform to read full ImageData accurately
+        const currentTransform = ctx.getTransform();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        ctx.setTransform(currentTransform); // Restore transform
+        
         let minX = canvas.width, minY = canvas.height, maxX = 0, maxY = 0;
         let hasDrawing = false;
 
+        // Find the bounds of the actual drawing (in device pixels)
         for (let y = 0; y < canvas.height; y++) {
           for (let x = 0; x < canvas.width; x++) {
             const i = (y * canvas.width + x) * 4;
@@ -820,26 +900,80 @@ function App() {
         }
 
         if (hasDrawing) {
-          const croppedWidth = maxX - minX + 1;
-          const croppedHeight = maxY - minY + 1;
+          // Add a small padding (in device pixels)
+          const PADDING_DPR = 20 * dpr; 
+          
+          minX = Math.max(0, minX - PADDING_DPR);
+          minY = Math.max(0, minY - PADDING_DPR);
+          maxX = Math.min(canvas.width, maxX + PADDING_DPR);
+          maxY = Math.min(canvas.height, maxY + PADDING_DPR);
+          
+          const croppedWidth = maxX - minX;
+          const croppedHeight = maxY - minY;
+          
           const croppedCanvas = document.createElement('canvas');
           croppedCanvas.width = croppedWidth;
           croppedCanvas.height = croppedHeight;
           const croppedCtx = croppedCanvas.getContext('2d');
+          
           if (croppedCtx) {
+            // Temporarily reset transform to draw the cropped content correctly
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
             croppedCtx.drawImage(
               canvas,
               minX, minY, croppedWidth, croppedHeight,
               0, 0, croppedWidth, croppedHeight
             );
-            payload.image = croppedCanvas.toDataURL('image/png');
+            ctx.setTransform(currentTransform); // Restore transform
+
+            // --- FIX: Scale up while preserving aspect ratio for VLM/OCR ---
+            const scaledCanvas = document.createElement('canvas');
+            scaledCanvas.width = TARGET_VLM_SIZE;
+            scaledCanvas.height = TARGET_VLM_SIZE;
+            const scaledCtx = scaledCanvas.getContext('2d');
+            
+            if (scaledCtx) {
+              const ratio = Math.min(TARGET_VLM_SIZE / croppedWidth, TARGET_VLM_SIZE / croppedHeight);
+              const drawWidth = croppedWidth * ratio;
+              const drawHeight = croppedHeight * ratio;
+              const drawX = (TARGET_VLM_SIZE - drawWidth) / 2; // Center the image
+              const drawY = (TARGET_VLM_SIZE - drawHeight) / 2; // Center the image
+              
+              // Fill background with white for better contrast
+              scaledCtx.fillStyle = '#ffffff'; 
+              scaledCtx.fillRect(0, 0, TARGET_VLM_SIZE, TARGET_VLM_SIZE);
+              
+              // Draw the cropped content, scaled and centered
+              scaledCtx.drawImage(
+                croppedCanvas, 
+                0, 0, croppedWidth, croppedHeight, // Source
+                drawX, drawY, drawWidth, drawHeight // Destination (scaled and centered)
+              );
+              
+              payload.image = scaledCanvas.toDataURL('image/png');
+            } else {
+              payload.image = croppedCanvas.toDataURL('image/png');
+            }
           } else {
             payload.image = canvas.toDataURL('image/png');
           }
+
+          // Calculate where the center of the drawing is on the screen (CSS pixels)
+          const t = transformRef.current;
+          const centerWorldX = (minX + maxX) / 2;
+          const centerWorldY = (minY + maxY) / 2;
+          
+          // Apply inverse transform manually to convert world (DPR) to screen (CSS)
+          centerX = ((centerWorldX / dpr) * t.scale + t.offsetX / dpr);
+          centerY = ((centerWorldY / dpr) * t.scale + t.offsetY / dpr);
+          
         } else {
+          // If canvas is blank
           payload.image = canvas.toDataURL('image/png');
         }
       }
+      
+      // --- 3. Backend Call ---
       const response = await axios.post<{data: CalculationResponse[]}>(
         `${API_URL}/calculate`,
         payload,
@@ -867,15 +1001,16 @@ function App() {
       const newHistory: HistoryItem[] = [];
 
       solutions.forEach((sol, idx) => {
-        const latex = `\\[\\LARGE ${escapeHtml(sol.expression)} = ${escapeHtml(sol.answer)} \\]`;
+        const latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} = ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\]`;
         newLatex.push(latex);
-        newPositions.push({ x: 120, y: 200 + idx * 48 });
+        // Stagger positions slightly
+        newPositions.push({ x: centerX + idx * 20, y: centerY + idx * 48 });
 
         const item: HistoryItem = {
           id: Date.now() + '_sol_' + idx,
           type: 'solution',
           expression: sol.expression,
-          answer: sol.answer,
+          answer: String(sol.answer),
           steps: sol.steps && sol.steps.length ? sol.steps : ['(No steps provided)'],
           thumbnail: canvas.toDataURL(),
           createdAt: Date.now(),
@@ -893,51 +1028,46 @@ function App() {
         console.warn('Failed to save history to localStorage:', error);
       }
       return;
+      
     } catch (error) {
       console.error('Backend calculation failed:', error);
-      // no-op; fallback below
+      // Fallback below
     } finally {
       setLoading(false);
     }
 
-    // Fallback: use typed query if present
-    if (query.trim()) {
-      const local = trySolveLocally(query.trim());
+    // --- 4. Local Fallback ---
+    if (currentQuery) {
+      const local = trySolveLocally(currentQuery);
       if (local) {
         const canvasUrl = canvas.toDataURL();
-        const html = `<div style="white-space: pre-wrap; word-break: break-word; max-width: 80vw; font-size: 14px;">${escapeHtml(local.expression)} = ${escapeHtml(local.answer)}</div>`;
-        setLatexExpression((prev) => [...prev, html]);
+        const latex = `\\[\\LARGE ${escapeHtml(local.expression.replace(/ /g, '~'))} = ${escapeHtml(local.answer.replace(/ /g, '~'))} \\]`;
+        setLatexExpression((prev) => [...prev, latex]);
         setLatexPositions((prev) => [...prev, { x: 120, y: 200 + prev.length * 48 }]);
-    const item: HistoryItem = {
-      id: Date.now() + '_sol_local',
-      type: 'solution',
-      expression: local.expression,
-      answer: local.answer,
-      steps: local.steps,
-      thumbnail: canvasUrl,
-      createdAt: Date.now(),
-    };
-    const newH = [item, ...history];
-    setHistory(newH);
-    try {
-      localStorage.setItem('neuron_history_v1', JSON.stringify(newH));
-    } catch (error) {
-      console.warn('Failed to save history to localStorage:', error);
-    }
+        const item: HistoryItem = {
+          id: Date.now() + '_sol_local',
+          type: 'solution',
+          expression: local.expression,
+          answer: local.answer,
+          steps: local.steps,
+          thumbnail: canvasUrl,
+          createdAt: Date.now(),
+        };
+        const newH = [item, ...history];
+        setHistory(newH);
+        try {
+          localStorage.setItem('neuron_history_v1', JSON.stringify(newH));
+        } catch (error) {
+          console.warn('Failed to save history to localStorage:', error);
+        }
         return;
       }
     }
 
-    alert('No backend response and local solver could not parse the equation. Enter a linear or quadratic (e.g., 2x+3=9 or 1x^2+2x+1=0).');
+    alert('No backend response and local solver could not parse the equation. Ensure your equation is clear or try typing it.');
     setLoading(false);
-  }, [dictOfVars, history, query]);
+  }, [dictOfVars, history, query, dpr]);
 
-  // SAFETY: sanitize HTML for LaTeX wrapper
-  function escapeHtml(s: string) {
-    const div = document.createElement('div');
-    div.textContent = s;
-    return div.innerHTML;
-  }
 
   // THEME toggle
   const toggleTheme = () => setColorScheme(dark ? 'light' : 'dark');
@@ -945,20 +1075,27 @@ function App() {
   
   // Custom cursor size based on current tool and thickness
   const getCursorSize = useCallback(() => {
-    if (mode === 'eraser') return thickness * 8;
-    if (mode === 'pen') return thickness * 2;
-    return 16; // Default size for shape tools
+    // Cursor should scale inversely with canvas zoom so it always appears the same size on screen
+    const { scale } = transformRef.current;
+    if (mode === 'eraser') return (thickness * 8) / scale;
+    if (mode === 'pen') return (thickness * 2) / scale;
+    return 16 / scale; // Default size for shape tools
   }, [mode, thickness]);
 
   // Memo cursor position to avoid unnecessary re-renders
   const cursorStyle = useMemo(() => {
     if (!cursorPos) return null;
-    const { scale, offsetX, offsetY } = transformRef.current;
+    const { scale } = transformRef.current;
     const size = getCursorSize();
+    
+    // Cursor position is already calculated in CSS pixels
+    const screenX = cursorPos.x;
+    const screenY = cursorPos.y;
+    
     return {
       position: 'absolute',
-      left: ((cursorPos.x * scale + offsetX) / dpr) - size / 2,
-      top: ((cursorPos.y * scale + offsetY) / dpr) - size / 2,
+      left: screenX - size / 2, // Center cursor on the position
+      top: screenY - size / 2, // Center cursor on the position
       width: size,
       height: size,
       borderRadius: '50%',
@@ -969,9 +1106,9 @@ function App() {
       boxShadow: mode === 'eraser' ? '0 0 4px #ef4444' : '0 0 4px #6366f1',
       opacity: 0.9,
       transition: 'width 0.2s, height 0.2s',
-      transform: `scale(${1 / (scale * dpr)})`, // Maintain cursor size when zooming
+      transform: `scale(${scale})`, // Remove inverse scale
     } as const;
-  }, [cursorPos, mode, getCursorSize, dpr]);
+  }, [cursorPos, mode, getCursorSize]); 
 
   // UI
   return (
@@ -1165,6 +1302,7 @@ function App() {
                 zIndex: 40,
                 padding: 6,
                 color: dark ? '#fff' : '#111',
+                // Use mixBlendMode to make sure text stands out on any background
                 mixBlendMode: dark ? 'screen' : 'multiply',
                 background: 'transparent',
                 userSelect: 'none',
@@ -1356,4 +1494,4 @@ function App() {
   );
 }
 
-export default App;  
+export default App;
