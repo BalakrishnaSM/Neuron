@@ -1,4 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState, useMemo } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
+
+import { LogOut } from 'lucide-react';
 import {
   ColorSwatch,
   Group,
@@ -16,10 +19,10 @@ import {
   Divider,
   Tooltip,
   useMantineColorScheme,
+  Menu,
 } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import {
-  Menu,
   Mic,
   Image as LucideImage,
   Send,
@@ -34,6 +37,7 @@ import {
   RotateCw,
   Trash2,
   Save,
+  User,
 } from 'lucide-react';
 import axios from 'axios';
 import Draggable from 'react-draggable';
@@ -82,7 +86,8 @@ interface HistoryItem {
   answer?: string;
   steps?: string[];
   // For audio:
-  audioUrl?: string;
+  audioUrl?: string; // Stored locally for playback
+  audioSent?: boolean; // New: Flag to indicate audio was sent to backend
   // For image:
   imageName?: string;
   // Thumbnail of canvas or uploaded image
@@ -162,6 +167,25 @@ function trySolveLocally(input: string): GeneratedResult | null {
   }
 }
 
+// UTILITY: Convert Blob to Base64 String
+const blobToBase64 = (blob: Blob): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      if (typeof reader.result === 'string') {
+        // Extract the base64 part (after 'data:audio/webm;base64,')
+        const base64String = reader.result.split(',')[1];
+        resolve(base64String);
+      } else {
+        reject(new Error('Failed to read blob as string.'));
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+};
+
+
 // SAFETY: sanitize HTML for LaTeX wrapper
 function escapeHtml(s: string) {
   const div = document.createElement('div');
@@ -171,6 +195,8 @@ function escapeHtml(s: string) {
 
 // ---- Main Component ----
 function App() {
+  const { logout, user } = useAuth();
+
   // THEME
   const { colorScheme, setColorScheme } = useMantineColorScheme();
   const dark = colorScheme === 'dark';
@@ -218,6 +244,8 @@ function App() {
   // Microphone
   const mediaRef = useRef<MediaRecorder | null>(null);
   const chunksRef: React.MutableRefObject<Blob[]> = useRef([]);
+  // NEW: Ref to hold the audio blob just before sending
+  const audioBlobRef = useRef<Blob | null>(null); 
 
   // Image upload
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -308,7 +336,6 @@ function App() {
 
     const setSize = () => {
       // Use full viewport for responsive sizing
-      // FIX: Use const for w and h as they are not reassigned
       const w_css = window.innerWidth;
       const h_css = window.innerHeight;
       
@@ -339,7 +366,7 @@ function App() {
     const onResize = () => setSize();
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [dark]); // Removed w, h from setSize logic, keeping original dependencies.
+  }, [dark]);
 
   // PAN/ZOOM
   useEffect(() => {
@@ -771,37 +798,29 @@ function App() {
     reader.onload = () => {
       const img = new Image();
       img.onload = () => {
-        const canvas = canvasRef.current!;
-        const ctx = canvas.getContext('2d')!;
-        pushUndo();
-        // Draw image onto canvas, centered
-        const maxW = 800;
-        const maxH = 600;
-        const scaleX = maxW / img.width;
-        const scaleY = maxH / img.height;
-        const scale = Math.min(scaleX, scaleY, 1); // Scale down if too big
-        const w = img.width * scale;
-        const h = img.height * scale;
-        const x = (canvas.width / dpr - w) / 2;
-        const y = (canvas.height / dpr - h) / 2;
-        
-        ctx.drawImage(img, x, y, w, h);
-        
+        // Store image data for backend processing instead of drawing on canvas
+        const imageData = reader.result as string;
+
         // history
         const item: HistoryItem = {
           id: Date.now() + '_img',
           type: 'image',
           imageName: f.name,
-          thumbnail: canvas.toDataURL(),
+          // thumbnail: imageData, // Removed to prevent localStorage quota issues
           createdAt: Date.now(),
         };
         const newH = [item, ...history];
         setHistory(newH);
         try {
-          localStorage.setItem('neuron_history_v1', JSON.stringify(newH));
+          // Limit history to last 10 items to prevent localStorage quota issues
+          const limitedHistory = newH.slice(0, 10);
+          localStorage.setItem('neuron_history_v1', JSON.stringify(limitedHistory));
         } catch (error) {
           console.warn('Failed to save history to localStorage:', error);
         }
+
+        // Automatically trigger calculation with the uploaded image
+        runCalculationWithImage(imageData);
       };
       img.src = reader.result as string;
     };
@@ -809,37 +828,58 @@ function App() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  // MICROPHONE
+  // MICROPHONE (MODIFIED TO SEND DATA TO BACKEND)
   const [recording, setRecording] = useState(false);
   const toggleMic = async () => {
     if (recording) {
+      // 1. STOP recording
       mediaRef.current?.stop();
       setRecording(false);
+      
+      // The `rec.onstop` handler (defined below) will execute next,
+      // collecting chunks, creating the blob, saving to history, and setting audioBlobRef.
+      
+      // NEW: Immediately call runCalculation after stopping the recording
+      // We pass a flag to indicate we should use the audioBlobRef
+      setTimeout(() => runCalculation(true), 100); 
+
       return;
     }
+    
+    // 2. START recording
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const rec = new MediaRecorder(stream);
       mediaRef.current = rec;
       chunksRef.current = [];
+      audioBlobRef.current = null; // Reset audio blob reference
+
       rec.ondataavailable = (e) => chunksRef.current.push(e.data);
+      
       rec.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         const url = URL.createObjectURL(blob);
+        audioBlobRef.current = blob; // Store the blob for runCalculation
+
+        // Save to history (locally for playback)
         const item: HistoryItem = {
           id: Date.now() + '_aud',
           type: 'audio',
           audioUrl: url,
+          audioSent: true, // Mark as sent for processing
           createdAt: Date.now(),
         };
         const newH = [item, ...history];
         setHistory(newH);
         try {
-          localStorage.setItem('neuron_history_v1', JSON.stringify(newH));
+          // Limit history to last 10 items to prevent localStorage quota issues
+          const limitedHistory = newH.slice(0, 10);
+          localStorage.setItem('neuron_history_v1', JSON.stringify(limitedHistory));
         } catch (error) {
           console.warn('Failed to save history to localStorage:', error);
         }
       };
+      
       rec.start();
       setRecording(true);
     } catch (error) {
@@ -848,136 +888,20 @@ function App() {
     }
   };
 
-  // RUN calculation: send text or canvas → backend; else try local
-  const runCalculation = useCallback(async () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
+  // RUN calculation with uploaded image
+  const runCalculationWithImage = useCallback(async (imageData: string) => {
     setLoading(true);
-    const currentQuery = query.trim();
-    setQuery(''); // Clear the text area
 
-    // Prefer backend
     try {
-      // FIX: Explicitly cast payload to 'any' to satisfy ESLint
       const payload: any = {
         dict_of_vars: dictOfVars,
+        image: imageData,
       };
-      let centerX = 120;
-      let centerY = 200;
-      
-      // --- 1. Text Query Mode ---
-      if (currentQuery) {
-        payload.text = currentQuery;
-      } 
-      // --- 2. Canvas Image Mode ---
-      else {
-        // Crop the canvas to the drawn area and scale up for better OCR/VLM
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        
-        // Temporarily reset transform to read full ImageData accurately
-        const currentTransform = ctx.getTransform();
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        ctx.setTransform(currentTransform); // Restore transform
-        
-        let minX = canvas.width, minY = canvas.height, maxX = 0, maxY = 0;
-        let hasDrawing = false;
 
-        // Find the bounds of the actual drawing (in device pixels)
-        for (let y = 0; y < canvas.height; y++) {
-          for (let x = 0; x < canvas.width; x++) {
-            const i = (y * canvas.width + x) * 4;
-            if (imageData.data[i + 3] > 0) { // alpha > 0
-              minX = Math.min(minX, x);
-              minY = Math.min(minY, y);
-              maxX = Math.max(maxX, x);
-              maxY = Math.max(maxY, y);
-              hasDrawing = true;
-            }
-          }
-        }
-
-        if (hasDrawing) {
-          // Add a small padding (in device pixels)
-          const PADDING_DPR = 20 * dpr; 
-          
-          minX = Math.max(0, minX - PADDING_DPR);
-          minY = Math.max(0, minY - PADDING_DPR);
-          maxX = Math.min(canvas.width, maxX + PADDING_DPR);
-          maxY = Math.min(canvas.height, maxY + PADDING_DPR);
-          
-          const croppedWidth = maxX - minX;
-          const croppedHeight = maxY - minY;
-          
-          const croppedCanvas = document.createElement('canvas');
-          croppedCanvas.width = croppedWidth;
-          croppedCanvas.height = croppedHeight;
-          const croppedCtx = croppedCanvas.getContext('2d');
-          
-          if (croppedCtx) {
-            // Temporarily reset transform to draw the cropped content correctly
-            ctx.setTransform(1, 0, 0, 1, 0, 0);
-            croppedCtx.drawImage(
-              canvas,
-              minX, minY, croppedWidth, croppedHeight,
-              0, 0, croppedWidth, croppedHeight
-            );
-            ctx.setTransform(currentTransform); // Restore transform
-
-            // --- FIX: Scale up while preserving aspect ratio for VLM/OCR ---
-            const scaledCanvas = document.createElement('canvas');
-            scaledCanvas.width = TARGET_VLM_SIZE;
-            scaledCanvas.height = TARGET_VLM_SIZE;
-            const scaledCtx = scaledCanvas.getContext('2d');
-            
-            if (scaledCtx) {
-              const ratio = Math.min(TARGET_VLM_SIZE / croppedWidth, TARGET_VLM_SIZE / croppedHeight);
-              const drawWidth = croppedWidth * ratio;
-              const drawHeight = croppedHeight * ratio;
-              const drawX = (TARGET_VLM_SIZE - drawWidth) / 2; // Center the image
-              const drawY = (TARGET_VLM_SIZE - drawHeight) / 2; // Center the image
-              
-              // Fill background with white for better contrast
-              scaledCtx.fillStyle = '#ffffff'; 
-              scaledCtx.fillRect(0, 0, TARGET_VLM_SIZE, TARGET_VLM_SIZE);
-              
-              // Draw the cropped content, scaled and centered
-              scaledCtx.drawImage(
-                croppedCanvas, 
-                0, 0, croppedWidth, croppedHeight, // Source
-                drawX, drawY, drawWidth, drawHeight // Destination (scaled and centered)
-              );
-              
-              payload.image = scaledCanvas.toDataURL('image/png');
-            } else {
-              payload.image = croppedCanvas.toDataURL('image/png');
-            }
-          } else {
-            payload.image = canvas.toDataURL('image/png');
-          }
-
-          // Calculate where the center of the drawing is on the screen (CSS pixels)
-          const t = transformRef.current;
-          const centerWorldX = (minX + maxX) / 2;
-          const centerWorldY = (minY + maxY) / 2;
-          
-          // Apply inverse transform manually to convert world (DPR) to screen (CSS)
-          centerX = ((centerWorldX / dpr) * t.scale + t.offsetX / dpr);
-          centerY = ((centerWorldY / dpr) * t.scale + t.offsetY / dpr);
-          
-        } else {
-          // If canvas is blank
-          payload.image = canvas.toDataURL('image/png');
-        }
-      }
-      
-      // --- 3. Backend Call ---
       const response = await axios.post<{data: CalculationResponse[]}>(
         `${API_URL}/calculate`,
         payload,
-        { timeout: 180000 }
+        { timeout: 300000 } // Increased timeout to 5 minutes for image processing
       );
 
       const resp = response.data;
@@ -1004,7 +928,7 @@ function App() {
         const latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} = ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\]`;
         newLatex.push(latex);
         // Stagger positions slightly
-        newPositions.push({ x: centerX + idx * 20, y: centerY + idx * 48 });
+        newPositions.push({ x: 120 + idx * 20, y: 200 + idx * 48 });
 
         const item: HistoryItem = {
           id: Date.now() + '_sol_' + idx,
@@ -1012,7 +936,7 @@ function App() {
           expression: sol.expression,
           answer: String(sol.answer),
           steps: sol.steps && sol.steps.length ? sol.steps : ['(No steps provided)'],
-          thumbnail: canvas.toDataURL(),
+          thumbnail: imageData,
           createdAt: Date.now(),
         };
         newHistory.push(item);
@@ -1023,11 +947,228 @@ function App() {
       const mergedHistory = [...newHistory, ...history];
       setHistory(mergedHistory);
       try {
-        localStorage.setItem('neuron_history_v1', JSON.stringify(mergedHistory));
+        // Limit history to last 10 items to prevent localStorage quota issues
+        const limitedHistory = mergedHistory.slice(0, 10);
+        localStorage.setItem('neuron_history_v1', JSON.stringify(limitedHistory));
       } catch (error) {
         console.warn('Failed to save history to localStorage:', error);
       }
-      return;
+    } catch (error) {
+      console.error('Backend calculation failed:', error);
+      alert('Image analysis failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  }, [dictOfVars, history]);
+
+  // RUN calculation: send text, audio, or canvas → backend; else try local
+  // MODIFIED to accept a flag to force audio processing
+  const runCalculation = useCallback(async (isAudio: boolean = false) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    setLoading(true);
+    const currentQuery = query.trim();
+    setQuery(''); // Clear the text area
+
+    // Prefer backend
+    try {
+      const payload: any = {
+        dict_of_vars: dictOfVars,
+      };
+      let centerX = 120;
+      let centerY = 200;
+      let sentAudioData = false;
+      
+      // --- 1. Audio Query Mode (New Priority) ---
+      if (isAudio && audioBlobRef.current) {
+        payload.audio = await blobToBase64(audioBlobRef.current);
+        audioBlobRef.current = null; // Clear the ref after use
+        sentAudioData = true;
+      }
+      
+      // --- 2. Text Query Mode ---
+      else if (currentQuery) {
+        payload.text = currentQuery;
+      } 
+      
+      // --- 3. Canvas Image Mode ---
+      else {
+        // ... (existing canvas crop/scale logic remains)
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        
+        const currentTransform = ctx.getTransform();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        ctx.setTransform(currentTransform);
+
+        let minX = canvas.width, minY = canvas.height, maxX = 0, maxY = 0;
+        let hasDrawing = false;
+
+        for (let y = 0; y < canvas.height; y++) {
+          for (let x = 0; x < canvas.width; x++) {
+            const i = (y * canvas.width + x) * 4;
+            if (imageData.data[i + 3] > 0) {
+              minX = Math.min(minX, x);
+              minY = Math.min(minY, y);
+              maxX = Math.max(maxX, x);
+              maxY = Math.max(maxY, y);
+              hasDrawing = true;
+            }
+          }
+        }
+
+        if (hasDrawing) {
+          const PADDING_DPR = 20 * dpr; 
+          
+          minX = Math.max(0, minX - PADDING_DPR);
+          minY = Math.max(0, minY - PADDING_DPR);
+          maxX = Math.min(canvas.width, maxX + PADDING_DPR);
+          maxY = Math.min(canvas.height, maxY + PADDING_DPR);
+          
+          const croppedWidth = maxX - minX;
+          const croppedHeight = maxY - minY;
+          
+          const croppedCanvas = document.createElement('canvas');
+          croppedCanvas.width = croppedWidth;
+          croppedCanvas.height = croppedHeight;
+          const croppedCtx = croppedCanvas.getContext('2d');
+          
+          if (croppedCtx) {
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            croppedCtx.drawImage(
+              canvas,
+              minX, minY, croppedWidth, croppedHeight,
+              0, 0, croppedWidth, croppedHeight
+            );
+            ctx.setTransform(currentTransform);
+
+            // --- OCR ACCURACY FIX: INVERT COLORS IF IN DARK MODE ---
+            if (dark) {
+              const croppedImageData = croppedCtx.getImageData(0, 0, croppedWidth, croppedHeight);
+              const data = croppedImageData.data;
+              
+              for (let i = 0; i < data.length; i += 4) {
+                if (data[i + 3] > 0) {
+                  data[i] = 255 - data[i];
+                  data[i + 1] = 255 - data[i + 1];
+                  data[i + 2] = 255 - data[i + 2];
+                }
+              }
+              croppedCtx.putImageData(croppedImageData, 0, 0);
+              console.log("INFO: Dark mode drawing colors inverted for OCR/VLM contrast.");
+            }
+            // --- END OCR ACCURACY FIX ---
+            
+            // --- Scale up while preserving aspect ratio for VLM/OCR ---
+            const scaledCanvas = document.createElement('canvas');
+            scaledCanvas.width = TARGET_VLM_SIZE;
+            scaledCanvas.height = TARGET_VLM_SIZE;
+            const scaledCtx = scaledCanvas.getContext('2d');
+            
+            if (scaledCtx) {
+              const ratio = Math.min(TARGET_VLM_SIZE / croppedWidth, TARGET_VLM_SIZE / croppedHeight);
+              const drawWidth = croppedWidth * ratio;
+              const drawHeight = croppedHeight * ratio;
+              const drawX = (TARGET_VLM_SIZE - drawWidth) / 2;
+              const drawY = (TARGET_VLM_SIZE - drawHeight) / 2;
+              
+              scaledCtx.fillStyle = '#ffffff'; 
+              scaledCtx.fillRect(0, 0, TARGET_VLM_SIZE, TARGET_VLM_SIZE);
+              
+              scaledCtx.drawImage(
+                croppedCanvas, 
+                0, 0, croppedWidth, croppedHeight,
+                drawX, drawY, drawWidth, drawHeight
+              );
+              
+              payload.image = scaledCanvas.toDataURL('image/png');
+            } else {
+              payload.image = croppedCanvas.toDataURL('image/png');
+            }
+          } else {
+            payload.image = canvas.toDataURL('image/png');
+          }
+
+          const t = transformRef.current;
+          const centerWorldX = (minX + maxX) / 2;
+          const centerWorldY = (minY + maxY) / 2;
+          
+          centerX = ((centerWorldX / dpr) * t.scale + t.offsetX / dpr);
+          centerY = ((centerWorldY / dpr) * t.scale + t.offsetY / dpr);
+          
+        } else {
+          // If canvas is blank, only continue if audio or text was provided
+          if (sentAudioData || currentQuery) {
+            // Do nothing, payload will contain audio/text
+          } else {
+            payload.image = canvas.toDataURL('image/png');
+          }
+        }
+      }
+      
+      // Only proceed if we have text, image, or audio to send
+      if (payload.text || payload.image || payload.audio) {
+          
+          // --- 4. Backend Call ---
+          const response = await axios.post<{data: CalculationResponse[]}>(
+            `${API_URL}/calculate`,
+            payload,
+            { timeout: 300000 } // Increased timeout to 5 minutes for image processing
+          );
+
+          const resp = response.data;
+          const newVars: Record<string, string> = {};
+          const solutions: GeneratedResult[] = [];
+
+          resp.data.forEach((r) => {
+            if (r.assign) newVars[r.expr] = r.result;
+            solutions.push({
+              expression: r.expr,
+              answer: r.result,
+              steps: r.steps && r.steps.length ? r.steps : trySolveLocally(r.expr)?.steps,
+            });
+          });
+
+          setDictOfVars((prev) => ({ ...prev, ...newVars }));
+
+          // Render LaTeX + History
+          const newLatex: string[] = [];
+          const newPositions: LatexPosition[] = [];
+          const newHistory: HistoryItem[] = [];
+
+          solutions.forEach((sol, idx) => {
+            const latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} = ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\]`;
+            newLatex.push(latex);
+            // Stagger positions slightly
+            newPositions.push({ x: centerX + idx * 20, y: centerY + idx * 48 });
+
+            const item: HistoryItem = {
+              id: Date.now() + '_sol_' + idx,
+              type: 'solution',
+              expression: sol.expression,
+              answer: String(sol.answer),
+              steps: sol.steps && sol.steps.length ? sol.steps : ['(No steps provided)'],
+              thumbnail: canvas.toDataURL(),
+              createdAt: Date.now(),
+            };
+            newHistory.push(item);
+          });
+
+          setLatexExpression((prev) => [...prev, ...newLatex]);
+          setLatexPositions((prev) => [...prev, ...newPositions]);
+          const mergedHistory = [...newHistory, ...history];
+          setHistory(mergedHistory);
+          try {
+            // Limit history to last 10 items to prevent localStorage quota issues
+            const limitedHistory = mergedHistory.slice(0, 10);
+            localStorage.setItem('neuron_history_v1', JSON.stringify(limitedHistory));
+          } catch (error) {
+            console.warn('Failed to save history to localStorage:', error);
+          }
+          return;
+      }
       
     } catch (error) {
       console.error('Backend calculation failed:', error);
@@ -1036,7 +1177,7 @@ function App() {
       setLoading(false);
     }
 
-    // --- 4. Local Fallback ---
+    // --- 5. Local Fallback (Only for explicit text query) ---
     if (currentQuery) {
       const local = trySolveLocally(currentQuery);
       if (local) {
@@ -1056,7 +1197,9 @@ function App() {
         const newH = [item, ...history];
         setHistory(newH);
         try {
-          localStorage.setItem('neuron_history_v1', JSON.stringify(newH));
+          // Limit history to last 10 items to prevent localStorage quota issues
+          const limitedHistory = newH.slice(0, 10);
+          localStorage.setItem('neuron_history_v1', JSON.stringify(limitedHistory));
         } catch (error) {
           console.warn('Failed to save history to localStorage:', error);
         }
@@ -1064,9 +1207,9 @@ function App() {
       }
     }
 
-    alert('No backend response and local solver could not parse the equation. Ensure your equation is clear or try typing it.');
+    alert('No input detected (Canvas blank, no text, no successful audio).');
     setLoading(false);
-  }, [dictOfVars, history, query, dpr]);
+  }, [dictOfVars, history, query, dpr, dark]);
 
 
   // THEME toggle
@@ -1142,7 +1285,7 @@ function App() {
             🧠 Neuron
           </Text>
           <Badge color="grape" variant="light">
-            Math Notes
+            AI
           </Badge>
         </Box>
 
@@ -1158,6 +1301,23 @@ function App() {
             alignItems: 'center',
           }}
         >
+          {/* Profile Icon with Dropdown */}
+          {user && (
+            <Menu shadow="md" width={200}>
+              <Menu.Target>
+                <ActionIcon variant="subtle" size="lg" aria-label="User menu">
+                  <User size={20} />
+                </ActionIcon>
+              </Menu.Target>
+              <Menu.Dropdown>
+                <Menu.Label>Welcome, {user.username}</Menu.Label>
+                <Menu.Divider />
+                <Menu.Item leftSection={<LogOut size={14} />} onClick={logout}>
+                  Logout
+                </Menu.Item>
+              </Menu.Dropdown>
+            </Menu>
+          )}
           {/* Palette */}
           <Group gap="xs">
             {(DEFAULT_SWATCHES).map((sw) => (
@@ -1340,9 +1500,16 @@ function App() {
               onChange={onImageFile}
               style={{ display: 'none' }}
             />
-            <Tooltip label={recording ? 'Stop recording' : 'Record'}>
-              <ActionIcon size="lg" variant="light" onClick={toggleMic} aria-label="Microphone">
-                <Mic style={{ color: recording ? '#ef4444' : undefined }} />
+            <Tooltip label={recording ? 'Stop recording and solve' : 'Start recording'}>
+              <ActionIcon 
+                size="lg" 
+                variant="light" 
+                onClick={toggleMic} 
+                aria-label="Microphone"
+                // Highlight the mic icon when recording
+                color={recording ? 'red' : 'blue'} 
+              >
+                <Mic size={24} style={{ color: recording ? '#ef4444' : undefined }} />
               </ActionIcon>
             </Tooltip>
             <Tooltip label="Upload image">
@@ -1359,7 +1526,7 @@ function App() {
               value={query}
               onChange={(e) => setQuery(e.currentTarget.value)}
             />
-            <MantineButton onClick={runCalculation} variant="light" leftSection={<Send size={16} />} loading={loading}>
+            <MantineButton onClick={() => runCalculation(false)} variant="light" leftSection={<Send size={16} />} loading={loading}>
               Solve
             </MantineButton>
           </Group>
@@ -1457,11 +1624,15 @@ function App() {
                     {h.type === 'audio' && h.audioUrl && (
                       <Box mt="sm">
                         <audio controls src={h.audioUrl} style={{ width: '100%' }} />
+                        <Text size="xs" mt={4}>
+                            {h.audioSent ? 'Processing audio via backend...' : 'Audio ready for local playback.'}
+                        </Text>
                       </Box>
                     )}
                     {h.type === 'image' && h.imageName && (
                       <Box mt="sm">
                         <Text size="sm">Uploaded: {h.imageName}</Text>
+                        {/* Thumbnail removed to prevent localStorage quota issues */}
                       </Box>
                     )}
                   </Box>

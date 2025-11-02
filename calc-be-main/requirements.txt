@@ -1,0 +1,12 @@
+flask
+flask-cors
+opencv-python
+numpy
+easyocr
+langchain-ollama
+openai-whisper
+pyttsx3
+gtts
+pymongo
+flask-jwt-extended
+bcrypt
