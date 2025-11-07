@@ -206,23 +206,7 @@ function trySolveLocally(input: string): GeneratedResult | null {
   }
 }
 
-// UTILITY: Convert Blob to Base64 String
-const blobToBase64 = (blob: Blob): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      if (typeof reader.result === 'string') {
-        // Extract the base64 part (after 'data:audio/webm;base64,')
-        const base64String = reader.result.split(',')[1];
-        resolve(base64String);
-      } else {
-        reject(new Error('Failed to read blob as string.'));
-      }
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-};
+// UTILITY: Convert Blob to Base64 String (removed as unused)
 
 
 // SAFETY: sanitize HTML for LaTeX wrapper
@@ -754,7 +738,7 @@ function App() {
     script.onload = () => {
       if (window.MathJax) {
         // FIX: Explicitly cast to 'any' to satisfy ESLint
-        (window.MathJax.Hub.Config as Record<string, unknown>)({
+        (window.MathJax.Hub.Config as any)({
           tex2jax: {
             inlineMath: [['$', '$'], ['\\(', '\\)']],
             displayMath: [['$$', '$$'], ['\\[', '\\]']]
@@ -958,17 +942,34 @@ function App() {
       const newHistory: HistoryItem[] = [];
 
       solutions.forEach((sol, idx) => {
-        const latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} = ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\]`;
+        // Structure steps: detect if algorithmic (numbered) or general (bulleted)
+        let structuredSteps = sol.steps && sol.steps.length ? sol.steps : ['(No steps provided)'];
+        const isAlgorithmic = structuredSteps.some(step => /^\d+\./.test(step.trim()));
+        if (isAlgorithmic) {
+          structuredSteps = structuredSteps.map((step, i) => `${i + 1}. ${step}`);
+        } else {
+          structuredSteps = structuredSteps.map(step => `• ${step}`);
+        }
+
+        // Check if the expression appears to be a math expression
+        const isMath = /[\d+\-*/=xXyYzZ^()]/.test(sol.expression);
+        let latex: string;
+        if (isMath) {
+          latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} \\\\ ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\\\ ${structuredSteps.map(s => escapeHtml(s.replace(/ /g, '~'))).join(' \\\\ ')} \\]`;
+        } else {
+          // For text responses, render as plain HTML to ensure readability in any language
+          latex = `<div style="font-size: 16px; line-height: 1.5; font-family: Arial, sans-serif;"><strong>${escapeHtml(sol.expression)}</strong><br>${escapeHtml(String(sol.answer))}<br>${structuredSteps.map(s => escapeHtml(s)).join('<br>')}</div>`;
+        }
         newLatex.push(latex);
-        // Stagger positions slightly
-        newPositions.push({ x: 120 + idx * 20, y: 200 + idx * 48 });
+        // Stagger positions with more vertical spacing to avoid overlap
+        newPositions.push({ x: Math.max(50, Math.min(120 + idx * 10, window.innerWidth - 400)), y: 200 + idx * 200 });
 
         const item: HistoryItem = {
           id: Date.now() + '_sol_' + idx,
           type: 'solution',
           expression: sol.expression,
           answer: String(sol.answer),
-          steps: sol.steps && sol.steps.length ? sol.steps : ['(No steps provided)'],
+          steps: structuredSteps,
           thumbnail: imageData,
           createdAt: Date.now(),
         };
@@ -994,9 +995,8 @@ function App() {
     }
   }, [dictOfVars, history]);
 
-  // RUN calculation: send text, audio, or canvas → backend; else try local
-  // MODIFIED to accept a flag to force audio processing
-  const runCalculation = useCallback(async (isAudio: boolean = false) => {
+  // RUN calculation: send text or canvas → backend; else try local
+  const runCalculation = useCallback(async () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -1012,19 +1012,11 @@ function App() {
       };
       let centerX = 120;
       let centerY = 200;
-      let sentAudioData = false;
       
-      // --- 1. Audio Query Mode (New Priority) ---
-      if (isAudio && audioBlobRef.current) {
-        payload.audio = await blobToBase64(audioBlobRef.current);
-        audioBlobRef.current = null; // Clear the ref after use
-        sentAudioData = true;
-      }
-      
-      // --- 2. Text Query Mode ---
-      else if (currentQuery) {
+      // --- 1. Text Query Mode ---
+      if (currentQuery) {
         payload.text = currentQuery;
-      } 
+      }
       
       // --- 3. Canvas Image Mode ---
       else {
@@ -1133,17 +1125,17 @@ function App() {
           centerY = ((centerWorldY / dpr) * t.scale + t.offsetY / dpr);
           
         } else {
-          // If canvas is blank, only continue if audio or text was provided
-          if (sentAudioData || currentQuery) {
-            // Do nothing, payload will contain audio/text
+          // If canvas is blank, only continue if text was provided
+          if (currentQuery) {
+            // Do nothing, payload will contain text
           } else {
             payload.image = canvas.toDataURL('image/png');
           }
         }
       }
       
-      // Only proceed if we have text, image, or audio to send
-      if (payload.text || payload.image || payload.audio) {
+      // Only proceed if we have text or image to send
+      if (payload.text || payload.image) {
           
           // --- 4. Backend Call ---
           const response = await axios.post<{data: CalculationResponse[]}>(
@@ -1172,23 +1164,40 @@ function App() {
           const newPositions: LatexPosition[] = [];
           const newHistory: HistoryItem[] = [];
 
-          solutions.forEach((sol, idx) => {
-            const latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} = ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\]`;
-            newLatex.push(latex);
-            // Stagger positions slightly
-            newPositions.push({ x: centerX + idx * 20, y: centerY + idx * 48 });
+      solutions.forEach((sol, idx) => {
+        // Structure steps: detect if algorithmic (numbered) or general (bulleted)
+        let structuredSteps = sol.steps && sol.steps.length ? sol.steps : ['(No steps provided)'];
+        const isAlgorithmic = structuredSteps.some(step => /^\d+\./.test(step.trim()));
+        if (isAlgorithmic) {
+          structuredSteps = structuredSteps.map((step, i) => `${i + 1}. ${step}`);
+        } else {
+          structuredSteps = structuredSteps.map(step => `• ${step}`);
+        }
 
-            const item: HistoryItem = {
-              id: Date.now() + '_sol_' + idx,
-              type: 'solution',
-              expression: sol.expression,
-              answer: String(sol.answer),
-              steps: sol.steps && sol.steps.length ? sol.steps : ['(No steps provided)'],
-              thumbnail: canvas.toDataURL(),
-              createdAt: Date.now(),
-            };
-            newHistory.push(item);
-          });
+        // Check if the expression appears to be a math expression
+        const isMath = /[\d+\-*/=xXyYzZ^()]/.test(sol.expression);
+        let latex: string;
+        if (isMath) {
+          latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} \\\\ ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\\\ ${structuredSteps.map(s => escapeHtml(s.replace(/ /g, '~'))).join(' \\\\ ')} \\]`;
+        } else {
+          // For text responses, render as plain HTML to ensure readability in any language
+          latex = `<div style="font-size: 16px; line-height: 1.5; font-family: Arial, sans-serif;"><strong>${escapeHtml(sol.expression)}</strong><br>${escapeHtml(String(sol.answer))}<br>${structuredSteps.map(s => escapeHtml(s)).join('<br>')}</div>`;
+        }
+        newLatex.push(latex);
+        // Stagger positions with more vertical spacing to avoid overlap
+        newPositions.push({ x: Math.max(50, Math.min(centerX + idx * 10, window.innerWidth - 400)), y: centerY + idx * 200 });
+
+        const item: HistoryItem = {
+          id: Date.now() + '_sol_' + idx,
+          type: 'solution',
+          expression: sol.expression,
+          answer: String(sol.answer),
+          steps: structuredSteps,
+          thumbnail: canvas.toDataURL(),
+          createdAt: Date.now(),
+        };
+        newHistory.push(item);
+      });
 
           setLatexExpression((prev) => [...prev, ...newLatex]);
           setLatexPositions((prev) => [...prev, ...newPositions]);
@@ -1216,15 +1225,33 @@ function App() {
       const local = trySolveLocally(currentQuery);
       if (local) {
         const canvasUrl = canvas.toDataURL();
-        const latex = `\\[\\LARGE ${escapeHtml(local.expression.replace(/ /g, '~'))} = ${escapeHtml(local.answer.replace(/ /g, '~'))} \\]`;
+        // Structure steps for local fallback
+        let structuredSteps = local.steps && local.steps.length ? local.steps : ['(No steps provided)'];
+        const isAlgorithmic = structuredSteps.some(step => /^\d+\./.test(step.trim()));
+        if (isAlgorithmic) {
+          structuredSteps = structuredSteps.map((step, i) => `${i + 1}. ${step}`);
+        } else {
+          structuredSteps = structuredSteps.map(step => `• ${step}`);
+        }
+
+        // Check if the expression appears to be a math expression
+        const isMath = /[\d+\-*/=xXyYzZ^()]/.test(local.expression);
+        let latex: string;
+        if (isMath) {
+          latex = `\\[\\LARGE ${escapeHtml(local.expression.replace(/ /g, '~'))} \\\\ ${escapeHtml(local.answer.replace(/ /g, '~'))} \\\\ ${structuredSteps.map(s => escapeHtml(s.replace(/ /g, '~'))).join(' \\\\ ')} \\]`;
+        } else {
+          // For text responses, render as plain HTML to ensure readability in any language
+          latex = `<div style="font-size: 16px; line-height: 1.5; font-family: Arial, sans-serif;"><strong>${escapeHtml(local.expression)}</strong><br>${escapeHtml(local.answer)}<br>${structuredSteps.map(s => escapeHtml(s)).join('<br>')}</div>`;
+        }
         setLatexExpression((prev) => [...prev, latex]);
-        setLatexPositions((prev) => [...prev, { x: 120, y: 200 + prev.length * 48 }]);
+        setLatexPositions((prev) => [...prev, { x: 120, y: 200 + prev.length * 200 }]);
+
         const item: HistoryItem = {
           id: Date.now() + '_sol_local',
           type: 'solution',
           expression: local.expression,
           answer: local.answer,
-          steps: local.steps,
+          steps: structuredSteps,
           thumbnail: canvasUrl,
           createdAt: Date.now(),
         };
@@ -1241,7 +1268,7 @@ function App() {
       }
     }
 
-    alert('No input detected (Canvas blank, no text, no successful audio).');
+    alert('No input detected (Canvas blank, no text).');
     setLoading(false);
   }, [dictOfVars, history, query, dpr, dark]);
 
@@ -1292,7 +1319,7 @@ function App() {
       <Box
         className="w-full h-full"
         style={{
-          background: dark ? '#e9740eff' : '#fff',
+          background: dark ? '#101010ff' : '#fff',
           color: dark ? '#fff' : '#111',
           transition: 'background 200ms ease, color 200ms ease',
           minHeight: '100vh',
@@ -1300,6 +1327,7 @@ function App() {
           boxSizing: 'border-box',
           overflow: 'hidden',
         }}
+        
       >
         {/* HEADER / BRAND */}
         <Box
@@ -1472,6 +1500,7 @@ function App() {
             touchAction: 'none',
             cursor: 'none', // Hide default cursor
             zIndex: 1,
+            overflow: 'auto', // Enable infinite scroll
           }}
         />
         {/* Custom cursor indicator */}
@@ -1505,6 +1534,12 @@ function App() {
                 overflowWrap: 'break-word',
                 maxWidth: '80vw',
                 fontSize: '14px',
+                textAlign: 'justify',
+                textJustify: 'inter-word',
+                lineHeight: '1.5',
+                wordSpacing: '0.1em',
+                overflow: 'auto', // Enable scrolling for long content
+                maxHeight: '60vh', // Limit height to prevent overflow
               }}
               dangerouslySetInnerHTML={{ __html: latex }}
             />
@@ -1580,7 +1615,7 @@ function App() {
               value={query}
               onChange={(e) => setQuery(e.currentTarget.value)}
             />
-            <MantineButton onClick={() => runCalculation(false)} variant="light" leftSection={<Send size={16} />} loading={loading}>
+            <MantineButton onClick={() => runCalculation()} variant="light" leftSection={<Send size={16} />} loading={loading}>
               Solve
             </MantineButton>
           </Group>
@@ -1671,7 +1706,7 @@ function App() {
                         <Text fw={600} mb={4}>Steps:</Text>
                         <Stack gap={4}>
                           {(h.steps || []).map((s, i) => (
-                            <Text key={i} size="sm">• {s}</Text>
+                            <Text key={i} size="sm">{s}</Text>
                           ))}
                         </Stack>
                       </>

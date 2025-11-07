@@ -1,31 +1,41 @@
+import os
+import json
+import re
+from typing import Optional
+from dotenv import load_dotenv
+import logging
+import base64
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
-import os
-import json
-import base64
-import re
-import requests 
-from urllib.error import HTTPError 
 
-# --- Import pyttsx3 for local TTS ---
-import pyttsx3
-from langchain_ollama import OllamaLLM, ChatOllama
+# === NEW: Import deep-translator for stable translation ===
+try:
+    from deep_translator import GoogleTranslator
+except ImportError:
+    print("WARNING: 'deep-translator' not found. Please run 'pip install deep-translator'. Translation will be disabled.")
+    GoogleTranslator = None
+# =========================================================
+
+# === LANGCHAIN IMPORTS ===
+from langchain_ollama import OllamaLLM, ChatOllama, OllamaEmbeddings
 from langchain_core.messages import HumanMessage
-from dotenv import load_dotenv
-# Assuming 'models' module exists and contains User, History
-from models import User, History
-
-# === IMPORTS: LCEL RAG CHAIN ===
 from langchain_community.vectorstores import FAISS
-from langchain_ollama import OllamaEmbeddings
-# NOTE: Using 'langchain_classic' for chains as per your previous resolution
+# NOTE: Using 'langchain_classic' for older chain functions
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_classic.chains.retrieval import create_retrieval_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+# Assuming 'models' module exists and contains User, History
+# NOTE: Ensure models.py is present and functional
+from models import User, History 
+
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Configuration & Initialization ---
 
@@ -34,9 +44,8 @@ OLLAMA_TEXT_MODEL = os.getenv("OLLAMA_TEXT_MODEL", "qwen2:0.5b")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen3-vl:2b")
 
 # 2. RAG Configuration
-RAG_EMBEDDING_MODEL = "nomic-embed-text:latest"  # Reusing model from your working code
-RAG_FAISS_DIR = "notebook/faiss_db_nomic" # Directory containing your FAISS index (Path Fixed)
-# Define the threshold for RAG confidence. If the RAG answer contains this phrase, we fallback to LLM.
+RAG_EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "nomic-embed-text:latest")
+RAG_FAISS_DIR = "notebook/faiss_db_nomic" 
 RAG_FALLBACK_PHRASE = "not available in the documents" 
 
 app = Flask(__name__)
@@ -44,30 +53,22 @@ app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key-chan
 jwt = JWTManager(app)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Initialize base models (Same as before)
+# Initialize base models
 try:
-    # LLM for General Q/A and RAG answer generation
     llm = ChatOllama(model=OLLAMA_TEXT_MODEL, request_timeout=60) 
-    # Vision Model
     chat = ChatOllama(model=OLLAMA_VISION_MODEL)
-    print(f"Ollama Models initialized: Text={OLLAMA_TEXT_MODEL}, Vision={OLLAMA_VISION_MODEL}")
+    logging.info(f"Ollama Models initialized: Text={OLLAMA_TEXT_MODEL}, Vision={OLLAMA_VISION_MODEL}")
 except Exception as e:
-    print(f"Ollama Model init failed: {e}")
+    logging.error(f"Ollama Model init failed: {e}")
     # Mock implementations for error handling
-    llm = lambda x: type("MockResp", (object,), {"content": '{"expr": "LLM not available", "result": "Model initialization failed", "assign": false}'})()
+    llm = lambda x: type("MockResp", (object,), {"content": '[{"expr": "LLM not available", "result": "Model initialization failed", "assign": false}]'})()
     class MockChat:
         def invoke(self, messages):
-            return type("MockResp", (object,), {
-                "content": "Image analysis failed. Vision model not available."
-            })()
+            return type("MockResp", (object,), {"content": '[{"expr": "Image analysis failed", "result": "Vision model not available.", "assign": false}]'})()
     chat = MockChat()
 
-# TTS Engine Placeholder (pyttsx3)
-tts_engine = pyttsx3.init()
-
-# --- RAG Chain Initialization (New Section) ---
+# --- RAG Chain Initialization ---
 try:
-    # 1. Load Embeddings and Vector Store
     rag_embeddings = OllamaEmbeddings(model=RAG_EMBEDDING_MODEL)
     rag_vectorstore = FAISS.load_local(
         RAG_FAISS_DIR, 
@@ -76,8 +77,6 @@ try:
     )
     rag_retriever = rag_vectorstore.as_retriever(search_kwargs={"k": 3})
 
-    # 2. Define LCEL Prompt
-    # NOTE: The system prompt MUST contain a clear instruction for fallback detection.
     rag_template = (
         "You are an accurate, helpful AI assistant. Answer the user's question based ONLY on the context provided below. "
         f"If you cannot find the answer in the context, clearly state that the answer is **{RAG_FALLBACK_PHRASE}**."
@@ -90,70 +89,50 @@ try:
         ]
     )
     
-    # 3. Create the LCEL RAG Chain
     rag_document_chain = create_stuff_documents_chain(llm, rag_prompt)
     RAG_QA_CHAIN = create_retrieval_chain(rag_retriever, rag_document_chain)
-    print("RAG Chain (LCEL) initialized successfully.")
+    logging.info("RAG Chain (LCEL) initialized successfully.")
 
 except Exception as e:
-    print(f"RAG Chain initialization FAILED: {e}")
+    logging.error(f"RAG Chain initialization FAILED: {e}")
     # Mock chain for error handling
     def mock_rag_chain(input_dict):
-        return {'answer': f"RAG service unavailable: {e}. Check FAISS directory and Ollama models.", 'context': []}
+        return {'answer': f"RAG service unavailable: {e}. Check FAISS directory and Ollama models. {RAG_FALLBACK_PHRASE}", 'context': []}
     RAG_QA_CHAIN = type("MockRAG", (object,), {"invoke": mock_rag_chain})()
 
 
-# --- Utility Functions (Kept same) ---
-def handle_local_tts(text: str) -> str:
-    """ Generates TTS audio locally using pyttsx3 and returns a base64 placeholder. """
-    try:
-        print(f"ATTENTION: Using local pyttsx3 TTS placeholder for text: '{text[:50]}...'")
-        mock_audio_b64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAABeAAAEABAAFgCgYWN0bAAAAABJTkYGSGZyaWZmAAAARElTVAAAAA=="
-        return f"data:audio/wav;base64,{mock_audio_b64}" 
+# === Global Translator Client Initialization (using deep-translator) ===
+translator = GoogleTranslator(source='auto', target='en') if GoogleTranslator else None
+if translator:
+    logging.info("Deep-Translator initialized for source-to-English translation.")
+# =====================================================================
 
-    except Exception as e:
-        print(f"LOCAL TTS generation failed: {e}")
-        return ""
+# --- Utility Functions (Cleaned for brevity, assuming existing functionality) ---
 
 def preprocess_text(text: str) -> str:
-    if not text:
-        return ""
-    return text
+    return text.strip() if text else ""
 
 def clean_model_response(raw_response: str) -> str:
-    # ... (Keep existing complex JSON cleaning logic) ...
+    # NOTE: This complex logic is crucial for robust LLM JSON parsing
     raw_response = raw_response.strip()
 
-    # 1. Search for explicit JSON tags added in the prompt (REMOVED in new prompt, but kept for robustness)
-    tag_match = re.search(r'<JSON_RESPONSE>(.*?)</JSON_RESPONSE>', raw_response, re.DOTALL)
-    if tag_match:
-        raw_response = tag_match.group(1).strip()
-        print("INFO: Extracted content using JSON tags.")
+    # 1. Standard markdown cleaning (Handle ```json, ```python, ```, etc.)
+    if raw_response.startswith("```"):
+        raw_response = re.sub(r'^(```json|```python|```)\s*', '', raw_response, flags=re.IGNORECASE)
+        raw_response = re.sub(r'\s*```$', '', raw_response)
+        logging.info("Stripped markdown tags.")
 
-    # 2. Standard markdown cleaning (Handle ```json, ```python, ```, etc.)
-    if raw_response.startswith("```json") and raw_response.endswith("```"):
-        raw_response = raw_response[7:-3].strip()
-        print("INFO: Stripped ```json markdown.")
-    elif raw_response.startswith("```python") and raw_response.endswith("```"):
-        raw_response = raw_response[9:-3].strip()
-        print("INFO: Stripped ```python markdown.")
-    elif raw_response.startswith("```") and raw_response.endswith("```"):
-        raw_response = raw_response[3:-3].strip()
-        print("INFO: Stripped generic markdown.")
-
-    # 3. Standard parsing robustness
+    # 2. Find and trim to the primary JSON structure ({...} or [...])
     start_match = re.search(r'(\[|\{)', raw_response, re.DOTALL)
     if not start_match:
-        print("WARNING: No starting JSON bracket/brace found. Returning empty list string.")
+        logging.warning("No starting JSON bracket/brace found. Returning empty list string.")
         return "[]"
 
     start_index = start_match.start()
     trimmed_response = raw_response[start_index:].strip()
-
-    trimmed_response = re.sub(r"'", '"', trimmed_response)
     
+    # 3. Handle single object vs. list of objects
     if trimmed_response.startswith('{'):
-        # ... (rest of brace counting logic) ...
         brace_count = 0
         end_index = -1
         for i, char in enumerate(trimmed_response):
@@ -163,12 +142,10 @@ def clean_model_response(raw_response: str) -> str:
                 if brace_count == 0:
                     end_index = i + 1
                     break
-
         if end_index > 0:
             return '[' + trimmed_response[:end_index] + ']'
 
     if trimmed_response.startswith('['):
-        # ... (rest of bracket counting logic) ...
         bracket_count = 0
         end_index = -1
         for i, char in enumerate(trimmed_response):
@@ -178,46 +155,65 @@ def clean_model_response(raw_response: str) -> str:
                 if bracket_count == 0:
                     end_index = i + 1
                     break
-
         if end_index > 0:
             return trimmed_response[:end_index]
 
-    return trimmed_response
+    return "[]"
 
-def post_process_vlm_output(answers: list, llm_instance: OllamaLLM) -> list:
-    # ... (Keep the existing implementation) ...
-    # Removed for brevity, assumed to be correct based on previous version
-    return answers
+# --- NEW TRANSLATION UTILITY FUNCTIONS (using deep-translator) ---
+
+def safe_translate(text: str, dest_lang: str) -> str:
+    """Translates text using deep-translator, handling potential errors."""
+    if not GoogleTranslator:
+        return text 
+        
+    # Convert 'en-US' or 'kn-IN' format to standard 'en' or 'kn'
+    dest_lang_simple = dest_lang.split('-')[0].lower()
+    
+    if not text.strip():
+        return ""
+
+    try:
+        if dest_lang_simple == 'en':
+            # Use the global 'translator' object (source='auto', target='en')
+            result = translator.translate(text)
+        else:
+            # Create a temporary translator instance for the specific target language
+            # This handles the reverse translation (English -> Target Language)
+            temp_translator = GoogleTranslator(source='auto', target=dest_lang_simple)
+            result = temp_translator.translate(text)
+            
+        if result:
+            return result
+        
+        logging.warning(f"Translation failed for '{text[:20]}...' to {dest_lang_simple}. Returning original.")
+        return text
+
+    except Exception as e:
+        logging.error(f"Translation error: {e}. Returning original text.", exc_info=True)
+        return text
 
 
-# --- NEW: General LLM Handler for Fallback (Moved/Refactored Logic) ---
-def handle_general_llm_query(query: str, dict_of_vars: dict, language_code: str, username: str):
-    """ Handles the text query directly using the general LLM, enforcing JSON output. """
-    original_input = query
+# --- General LLM Handler ---
+def handle_general_llm_query(query: str, dict_of_vars: dict, original_lang_code: str, username: str):
+    """ Handles the text query directly using the general LLM. Query input is expected to be in ENGLISH."""
+    original_input = query 
     llm_input = original_input 
     
-    print(f"DEBUG: FALLBACK: Invoking general LLM ({OLLAMA_TEXT_MODEL})...")
+    logging.debug(f"FALLBACK: Invoking general LLM ({OLLAMA_TEXT_MODEL})...")
 
-    # --- PROMPT: FINAL, STRICT JSON ENFORCEMENT ---
+    # --- PROMPT: Enforce English response to be translated later ---
     prompt_text = (
         f"You are Neuron, an intelligent educational AI assistant specializing in **mathematics, physics, chemistry, biology, and civic education**.\n"
-        f"Your input may be in a regional language. Analyze the input, process it, and respond in the SAME language if the input is not English.\n\n"
+        f"The user input has been translated into English for you. **Your response MUST be in English.**\n\n"
         f"***STRICT OUTPUT ENFORCEMENT***\n"
         f"1. **Your ENTIRE response MUST be ONLY a raw JSON list.** Do not include any explanations, conversational filler, markdown tags (e.g., ```json, ```python, ```), or any text before or after the JSON list.\n"
         f"2. **The JSON structure MUST be a list of dictionaries** with keys: `expr`, `result`, and `assign`.\n\n"
-        f"🎓 Tasks and Rules:\n"
-        f"- **Simple Numerical/Algebraic Input:** Set 'result' to the **direct numerical value or algebraic solution only**.\n"
-        f"- **Complex Problems/Definitions/Civic Issues:** Set 'result' to a **full, step-by-step explanation or clear definition**.\n"
-        f"- **News/General Text:** Provide a **brief, relevant explanation of the person or event.**\n\n"
-        f"📘 Examples:\n"
-        f"  - Math Solution: `[{{\"expr\": \"integration of xdx\", \"result\": \"x^2/2 + C\", \"assign\": false}}]`\n" 
-        f"  - Definition (Kannada): `[{{\"expr\": \"ದ್ಯುತಿಸಂಶ್ಲೇಷಣೆ\", \"result\": \"ದ್ಯುತಿಸಂಶ್ಲೇಷಣೆಯು ಸಸ್ಯಗಳು ಸೂರ್ಯನ ಬೆಳಕು, ಕಾರ್ಬನ್ ಡೈಆಕ್ಸೈಡ್ ಮತ್ತು ನೀರನ್ನು ಬಳಸಿ ಗ್ಲೂಕೋಸ್ ಮತ್ತು ಆಮ್ಲಜನಕವನ್ನು ಉತ್ಪಾದಿಸುವ ಪ್ರಕ್ರಿಯೆಯಾಗಿದೆ.\", \"assign\": false}}]`\n"
         f"Variables in Scope: {dict_of_vars}\n\n"
-        f"--- BEGIN USER INPUT ---\n"
+        f"--- BEGIN USER INPUT (English) ---\n"
         f"Input: {llm_input}\n"
         f"--- END USER INPUT ---\n"
     )
-    # --- END PROMPT ---
 
     resp_data = None
     try:
@@ -226,50 +222,40 @@ def handle_general_llm_query(query: str, dict_of_vars: dict, language_code: str,
         
         raw_response = clean_model_response(raw_response)
         resp_data = json.loads(raw_response)
-        print("DEBUG: General LLM JSON Parsing SUCCESS.")
+        logging.debug("General LLM JSON Parsing SUCCESS.")
 
     except Exception as e:
-        print(f"DEBUG: General LLM FINAL PARSE FAILURE: {e}")
-        error_msg = str(e)
-        error_result = "Sorry, the AI model encountered a general error."
-        if "ReadTimeoutError" in error_msg or "TimeoutError" in error_msg:
-            error_result = "The AI model took too long (Timeout: 60s). Please check Ollama server."
+        logging.error(f"General LLM FINAL PARSE FAILURE: {e}")
+        error_result = "Sorry, the AI model encountered an error or timed out."
         resp_data = [{"expr": original_input, "result": error_result, "assign": False}]
     
     # --- JSON Standardization & History ---
-    if isinstance(resp_data, dict):
-        resp_data = [resp_data]
-    elif not isinstance(resp_data, list):
-        resp_data = [{"expr": original_input, "result": str(resp_data), "assign": False}]
-    elif not resp_data:
-        resp_data = [{"expr": original_input, "result": "Model returned an empty response.", "assign": False}]
-
-    # Ensure required keys exist
-    first_result = resp_data[0]
-    first_result.setdefault("expr", original_input)
-    first_result.setdefault("result", "No result provided")
-    first_result.setdefault("assign", False)
-    first_result["result"] = str(first_result["result"])
+    if not isinstance(resp_data, list):
+           resp_data = [{"expr": original_input, "result": str(resp_data), "assign": False}]
     
-    tts_audio = handle_local_tts(first_result["result"])
-    first_result["tts_audio"] = tts_audio
-    
-    History.save_calculation(username, {
-        "type": "text_general",
-        "input": original_input,
-        "result": first_result["result"],
-        "metadata": {"language_code": language_code}
-    })
-    return resp_data
+    # Ensure required keys exist in the first item
+    if resp_data and isinstance(resp_data[0], dict):
+        first_result = resp_data[0]
+        first_result.setdefault("expr", original_input)
+        first_result.setdefault("result", "No result provided")
+        first_result.setdefault("assign", False)
+        first_result["result"] = str(first_result["result"])
+
+        History.save_calculation(username, {
+            "type": "text_general",
+            "input": original_input,
+            "result": first_result["result"],
+            "metadata": {"language_code": original_lang_code}
+        })
+    return resp_data # Returns JSON data where 'result' is in English
 
 
-# --- NEW: RAG Handler (Moved/Refactored Logic) ---
-def handle_rag_query(query: str, language_code: str, username: str):
-    """ Handles queries against the FAISS vector store using the LCEL RAG chain. """
-    print(f"DEBUG: Initiating RAG query for user '{username}' with input: '{query[:50]}...'")
+# --- RAG Handler ---
+def handle_rag_query(query: str, original_lang_code: str, username: str):
+    """ Handles queries against the FAISS vector store. Query input is expected to be in ENGLISH."""
+    logging.debug(f"Initiating RAG query for user '{username}' with input (English): '{query[:50]}...'")
 
     try:
-        # Invoke the pre-initialized RAG Chain
         rag_result = RAG_QA_CHAIN.invoke({"input": query})
 
         final_answer = rag_result.get('answer', f'RAG chain failed to return an answer. {RAG_FALLBACK_PHRASE}')
@@ -277,47 +263,38 @@ def handle_rag_query(query: str, language_code: str, username: str):
         
         # Check for RAG fallback phrase to signal low confidence
         if RAG_FALLBACK_PHRASE.lower() in final_answer.lower():
-            print("DEBUG: RAG returned low-confidence answer (no documents found). Triggering LLM fallback.")
+            logging.debug("RAG returned low-confidence answer (no documents found). Triggering LLM fallback.")
             return None, None, None # Signal fallback
             
-        # Extract metadata for sources
-        sources = set([doc.metadata.get('source', 'N/A') for doc in source_documents])
-        source_info = list(sources)
-        
-        # Prepare response data
-        tts_audio = handle_local_tts(final_answer)
+        # Prepare response data (final_answer is in ENGLISH)
         resp_data = [{
             "expr": query,
             "result": final_answer,
             "assign": False,
-            "tts_audio": tts_audio,
-            "sources": source_info
+            "sources": list(set([doc.metadata.get('source', 'N/A') for doc in source_documents]))
         }]
         
         History.save_calculation(username, {
             "type": "rag",
             "input": query,
             "result": final_answer,
-            "metadata": {"language_code": language_code, "sources": source_info}
+            "metadata": {"language_code": original_lang_code, "sources": resp_data[0]['sources']}
         })
-        print("DEBUG: RAG query complete. Returning result.")
+        logging.debug("RAG query complete. Returning result.")
         return resp_data, 200, None
 
     except Exception as e:
-        print(f"DEBUG: RAG chain failed: {e}. Falling back to general LLM.")
+        logging.error(f"RAG chain failed: {e}. Falling back to general LLM.", exc_info=True)
         return None, None, e # Signal fallback
 
-# --- Authentication/History Endpoints (Kept same) ---
+# --- Authentication/History Endpoints (Unchanged) ---
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"message": "Neuron Backend API", "status": "running"}), 200
 
-# ... (register, login, get_history endpoints are unchanged and omitted for brevity) ...
-
-# --- Authentication/History Endpoints (Same as before) ---
 @app.route("/register", methods=["POST"])
 def register():
-    # ... (Keep the existing implementation) ...
+    # ... (Implementation omitted for brevity) ...
     try:
         data = request.json
         username = data.get("username", "").strip()
@@ -326,28 +303,21 @@ def register():
 
         if not username or not email or not password:
             return jsonify({"error": "Username, email, and password are required"}), 400
-
         if len(password) < 6:
             return jsonify({"error": "Password must be at least 6 characters long"}), 400
+        if User.find_by_username(username) or User.find_by_email(email):
+             return jsonify({"error": "Username or email already exists"}), 409
 
-        # Check if user already exists
-        if User.find_by_username(username):
-            return jsonify({"error": "Username already exists"}), 409
-
-        if User.find_by_email(email):
-            return jsonify({"error": "Email already exists"}), 409
-
-        # Create user
         user_id = User.create_user(username, email, password)
         return jsonify({"message": "User registered successfully", "user_id": user_id}), 201
 
     except Exception as e:
-        print(f"Registration error: {e}")
+        logging.error(f"Registration error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/login", methods=["POST"])
 def login():
-    # ... (Keep the existing implementation) ...
+    # ... (Implementation omitted for brevity) ...
     try:
         data = request.json
         email = data.get("email", "").strip()
@@ -360,35 +330,31 @@ def login():
         if not user or not User.verify_password(user["password"], password):
             return jsonify({"error": "Invalid credentials"}), 401
 
-        # Update last login
         User.update_last_login(user["username"])
-
-        # Create access token
         access_token = create_access_token(identity=user["username"])
         return jsonify({"access_token": access_token, "username": user["username"]}), 200
 
     except Exception as e:
-        print(f"Login error: {e}")
+        logging.error(f"Login error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/history", methods=["GET"])
 @jwt_required()
 def get_history():
-    # ... (Keep the existing implementation) ...
+    # ... (Implementation omitted for brevity) ...
     try:
-        username = get_jwt_identity()         
+        username = get_jwt_identity() 
         history = History.get_user_history(username)
         return jsonify({"history": history}), 200
 
     except Exception as e:
-        print(f"Get history error: {e}")
+        logging.error(f"Get history error: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-# --- NEW: RAG Query Endpoint (Now only uses RAG handler) ---
 @app.route("/rag_query", methods=["POST"])
 @jwt_required()
 def rag_query_endpoint():
-    """ Public endpoint for RAG queries. Does NOT contain the LLM fallback. """
+    # ... (Implementation omitted for brevity) ...
     try:
         data = request.json
         query = data.get("query", "").strip()
@@ -398,20 +364,21 @@ def rag_query_endpoint():
         if not query:
              return jsonify({"error": "Query text is required for RAG analysis."}), 400
 
+        # NOTE: This endpoint assumes the input 'query' is already in ENGLISH 
         resp_data, status, error = handle_rag_query(query, language_code, username)
 
         if error or resp_data is None:
-             # This specific endpoint is designed for RAG, so an error/no-match returns a failure message
              return jsonify({"error": "RAG query failed or found no relevant documents."}), 500
         
+        # No reverse translation needed here as this is a specific, separate RAG endpoint
         return jsonify({"data": resp_data}), 200
 
     except Exception as e:
-        print(f"DEBUG: Unexpected fatal error in rag_query_endpoint: {e}")
+        logging.error(f"Unexpected fatal error in rag_query_endpoint: {e}")
         return jsonify({"error": f"Internal server error: {e}"}), 500
 
 
-# --- API Endpoint (calculate - NOW THE ROUTING ENDPOINT) ---
+# --- API Endpoint (calculate) ---
 @app.route("/calculate", methods=["POST"])
 @jwt_required()
 def calculate():
@@ -424,30 +391,28 @@ def calculate():
         image_data = data.get("image", "")
         audio_data = data.get("audio", "") 
         dict_of_vars = data.get("dict_of_vars", {})
-        language_code = data.get("language_code", "en-US") 
-        username = get_jwt_identity() # Get username early
-
+        language_code = data.get("language_code", "en-US") # User's target language
+        username = get_jwt_identity() 
+        target_lang = language_code.split('-')[0].lower() # e.g., 'kn-IN' -> 'kn'
+        
         # --- 1. Audio Input (DISABLED) ---
         if audio_data:
-            print("DEBUG: Audio input received but ASR is disabled.")
-            return jsonify({"error": "Audio input (ASR) is currently disabled due to external service instability."}), 500
+            logging.warning("Audio input (ASR) is currently disabled.")
+            return jsonify({"error": "Audio input (ASR) is currently disabled."}), 500
         
         # --- 2. Image Input (Vision Model) ---
         elif image_data:
-            # ... (VLM logic remains the same) ...
-            print("DEBUG: Image data received. Initiating VLM processing for direct response.")
+            logging.info("Image data received. Initiating VLM processing.")
             raw_b64 = image_data.split(",")[1] if image_data.startswith("data:image") else image_data
             
             # --- VLM-SPECIFIC PROMPT (STRICT RAW JSON) ---
             vlm_prompt_text = (
-            f"You are Neuron, an expert VLM assistant. Analyze the image for problems or content.\n"
-    f"***TASK: Extract the core content or analyze the image and generate a brief explanation/solution.***\n\n"
-    f"1. **Your ENTIRE response MUST be ONLY a raw JSON list.** Do not include any explanations, conversational filler, markdown tags (e.g., ```json, ```python, ```), or any text before or after the JSON list.\n"
-    f"2. **The JSON structure MUST be a list of dictionaries** with keys: `expr`, `result`, and `assign`.\n"
-    f"3. **Format:** `[{{\"expr\": \"Image Summary/Problem\", \"result\": \"Detailed Answer/Explanation\", \"assign\": false/true}}]`\n\n"
-    f"Variables: {dict_of_vars}\n"
+                f"You are Neuron, an expert VLM assistant. Analyze the image and generate a brief explanation/solution in **English**.\n"
+                f"***STRICT OUTPUT ENFORCEMENT***\n"
+                f"1. **Your ENTIRE response MUST be ONLY a raw JSON list** with keys: `expr`, `result`, and `assign`.\n"
+                f"2. **Format:** `[{{\"expr\": \"Image Summary/Problem\", \"result\": \"Detailed Answer/Explanation\", \"assign\": false/true}}]`\n"
+                f"Variables: {dict_of_vars}\n"
             )
-            # --- END VLM-SPECIFIC PROMPT ---
             
             vlm_resp_data = None
             try:
@@ -460,57 +425,83 @@ def calculate():
                 raw_response = chat.invoke([message])
                 raw_response_content = clean_model_response(raw_response.content)
                 vlm_resp_data = json.loads(raw_response_content)
-                print("DEBUG: VLM JSON Parsing SUCCESS.")
+                logging.debug("VLM JSON Parsing SUCCESS.")
 
             except Exception as e:
-                print(f"DEBUG: VLM FINAL PARSE FAILURE: {e}")
-                vlm_resp_data = [{"expr": "Image Analysis Failed", "result": "VLM could not generate valid JSON. Please try again.", "assign": False}]
+                logging.error(f"VLM FINAL PARSE FAILURE: {e}")
+                vlm_resp_data = [{"expr": "Image Analysis Failed", "result": "VLM could not generate valid JSON.", "assign": False}]
             
-            if isinstance(vlm_resp_data, dict): vlm_resp_data = [vlm_resp_data]
-            elif not isinstance(vlm_resp_data, list) or not vlm_resp_data:
+            if not isinstance(vlm_resp_data, list) or not vlm_resp_data:
                 vlm_resp_data = [{"expr": "Image Analysis Failed", "result": "VLM returned unprocessable data.", "assign": False}]
 
+            # VLM Output: Translate back to user's language (if needed)
+            if target_lang != 'en':
+                logging.info(f"Translating VLM output from 'en' back to {target_lang}...")
+                for item in vlm_resp_data:
+                    english_result = item.get("result", "")
+                    if english_result.strip():
+                        item['result'] = safe_translate(english_result, target_lang)
+
+            # History saving for VLM remains the same
             first_result = vlm_resp_data[0]
             first_result["result"] = str(first_result.get("result", ""))
-            
-            tts_audio = handle_local_tts(first_result["result"])
-            first_result["tts_audio"] = tts_audio
-            
             History.save_calculation(username, {
                 "type": "image",
                 "input": first_result.get("expr", "Image Analysis"),
                 "result": first_result["result"],
                 "metadata": {"language_code": language_code}
             })
-            print("DEBUG: Image analysis complete. Returning VLM JSON response.")
             return jsonify({"data": vlm_resp_data})
 
 
-        # --- 3. Text-only Handling: RAG-First Routing ---
+        # --- 3. Text-only Handling: RAG-First Routing with Translation ---
         if text:
             
-            # --- Attempt 1: RAG Query ---
-            rag_data, status, error = handle_rag_query(text, language_code, username)
+            # 3a. Translate User Input (Source Language -> English)
+            text_english = text
+            if target_lang != 'en':
+                logging.info(f"Translating input from {target_lang} to 'en'...")
+                text_english = safe_translate(text, 'en')
+                if text_english == text:
+                    logging.warning("Input translation failed or returned original text.")
+
+            # --- Attempt 1: RAG Query (Uses English input) ---
+            rag_data, status, error = handle_rag_query(text_english, language_code, username)
             
             if rag_data is not None:
-                # RAG was successful (found documents and returned a confident answer)
-                print("DEBUG: RAG success. Returning RAG result.")
-                return jsonify({"data": rag_data}), status
+                # RAG was successful (The result is in ENGLISH)
+                llm_data = rag_data
+                logging.debug("RAG success. Continuing to reverse translation.")
+            else:
+                # RAG failed (No confident answer)
+                logging.debug("RAG failed or signaled fallback. Falling back to general LLM.")
+                # --- Attempt 2: General LLM Fallback (Uses English input) ---
+                llm_data = handle_general_llm_query(text_english, dict_of_vars, language_code, username)
+                logging.debug("LLM Fallback complete. Continuing to reverse translation.")
+
+            # --- 4. Translate Model Output (English -> Target Language) ---
             
-            # If rag_data is None, it means the RAG chain signaled a fallback (no documents found)
-            print("DEBUG: RAG failed to find documents or returned error. Falling back to general LLM.")
+            final_data = llm_data
+
+            if target_lang != 'en':
+                logging.info(f"Translating model output from 'en' back to {target_lang}...")
+                for item in final_data:
+                    english_result = item.get("result", "")
+                    
+                    # Prevent translating empty or error messages
+                    if english_result.strip() and not ("error" in english_result.lower() or "not available" in english_result.lower()):
+                        translated_result = safe_translate(english_result, target_lang)
+                        item['result'] = translated_result
             
-            # --- Attempt 2: General LLM Fallback ---
-            llm_data = handle_general_llm_query(text, dict_of_vars, language_code, username)
-            print("DEBUG: LLM Fallback complete. Returning LLM result.")
-            return jsonify({"data": llm_data}), 200
+            logging.debug("Final response ready. Returning JSON.")
+            return jsonify({"data": final_data}), 200
 
         # No valid input
-        print("DEBUG: No valid text, image, or audio input found.")
-        return jsonify({"error":"No valid text, audio, or image input provided for analysis."}), 400
+        logging.warning("No valid text or image input found.")
+        return jsonify({"error":"No valid text or image input provided for analysis."}), 400
 
     except Exception as e:
-        print(f"DEBUG: Unexpected fatal error in calculate endpoint: {e}")
+        logging.critical(f"Unexpected fatal error in calculate endpoint: {e}", exc_info=True)
         return jsonify({"error": f"Internal server error: {e}"}), 500
 
 
