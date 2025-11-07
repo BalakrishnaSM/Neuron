@@ -2,11 +2,15 @@ flask
 flask-cors
 opencv-python
 numpy
-easyocr
 langchain-ollama
 openai-whisper
 pyttsx3
-gtts
+dwani
 pymongo
 flask-jwt-extended
 bcrypt
+vosk
+pyaudio
+python-dotenv
+langdetect
+deep-translator

@@ -20,6 +20,7 @@ import {
   Tooltip,
   useMantineColorScheme,
   Menu,
+  Select,
 } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import {
@@ -58,6 +59,8 @@ const DEFAULT_SWATCHES = [
   '#000000',
 ];
 const TARGET_VLM_SIZE = 512; // Standard size for most VLMs like moondream
+
+// Audio blob ref removed as Dwani is no longer used
 
 // ---- Types ----
 interface GeneratedResult {
@@ -102,7 +105,7 @@ interface Session {
   canvasDataUrl: string;
 }
 
-// Add global MathJax typing
+// Add global MathJax and SpeechRecognition typing
 declare global {
   interface Window {
     MathJax: {
@@ -111,6 +114,42 @@ declare global {
         Config: (config: { tex2jax: { inlineMath: string[][] } }) => void;
       };
     };
+    SpeechRecognition: typeof SpeechRecognition;
+    webkitSpeechRecognition: typeof SpeechRecognition;
+  }
+
+  interface SpeechRecognition extends EventTarget {
+    continuous: boolean;
+    interimResults: boolean;
+    lang: string;
+    start(): void;
+    stop(): void;
+    onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => any) | null;
+    onerror: ((this: SpeechRecognition, ev: SpeechRecognitionErrorEvent) => any) | null;
+    onend: ((this: SpeechRecognition, ev: Event) => any) | null;
+  }
+
+  interface SpeechRecognitionEvent extends Event {
+    results: SpeechRecognitionResultList;
+  }
+
+  interface SpeechRecognitionErrorEvent extends Event {
+    error: string;
+  }
+
+  interface SpeechRecognitionResultList {
+    [index: number]: SpeechRecognitionResult;
+    length: number;
+  }
+
+  interface SpeechRecognitionResult {
+    [index: number]: SpeechRecognitionAlternative;
+    length: number;
+  }
+
+  interface SpeechRecognitionAlternative {
+    transcript: string;
+    confidence: number;
   }
 }
 
@@ -241,11 +280,10 @@ function App() {
   // Loading state for solve button
   const [loading, setLoading] = useState(false);
 
-  // Microphone
-  const mediaRef = useRef<MediaRecorder | null>(null);
-  const chunksRef: React.MutableRefObject<Blob[]> = useRef([]);
-  // NEW: Ref to hold the audio blob just before sending
-  const audioBlobRef = useRef<Blob | null>(null); 
+  // Speech Recognition
+  const [selectedLanguage, setSelectedLanguage] = useState("en-US");
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
 
   // Image upload
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -716,7 +754,7 @@ function App() {
     script.onload = () => {
       if (window.MathJax) {
         // FIX: Explicitly cast to 'any' to satisfy ESLint
-        (window.MathJax.Hub.Config as any)({
+        (window.MathJax.Hub.Config as Record<string, unknown>)({
           tex2jax: {
             inlineMath: [['$', '$'], ['\\(', '\\)']],
             displayMath: [['$$', '$$'], ['\\[', '\\]']]
@@ -754,6 +792,32 @@ function App() {
     const storedH = localStorage.getItem('neuron_history_v1');
     if (storedH) setHistory(JSON.parse(storedH));
   }, []);
+
+  // Speech Recognition initialization
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      if (!recognitionRef.current) {
+        recognitionRef.current = new SpeechRecognition();
+        recognitionRef.current.continuous = false;
+        recognitionRef.current.interimResults = false;
+
+        recognitionRef.current.onresult = (event) => {
+          const transcript = event.results[0][0].transcript;
+          setQuery(transcript);
+          setIsListening(false);
+        };
+        recognitionRef.current.onerror = (event) => {
+          console.error("Speech recognition error:", event.error);
+          setIsListening(false);
+        };
+        recognitionRef.current.onend = () => {
+          setIsListening(false);
+        };
+      }
+      recognitionRef.current.lang = selectedLanguage;
+    }
+  }, [selectedLanguage]);
 
   const saveSession = useCallback(() => {
     const canvas = canvasRef.current;
@@ -828,63 +892,32 @@ function App() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  // MICROPHONE (MODIFIED TO SEND DATA TO BACKEND)
-  const [recording, setRecording] = useState(false);
-  const toggleMic = async () => {
-    if (recording) {
-      // 1. STOP recording
-      mediaRef.current?.stop();
-      setRecording(false);
-      
-      // The `rec.onstop` handler (defined below) will execute next,
-      // collecting chunks, creating the blob, saving to history, and setting audioBlobRef.
-      
-      // NEW: Immediately call runCalculation after stopping the recording
-      // We pass a flag to indicate we should use the audioBlobRef
-      setTimeout(() => runCalculation(true), 100); 
+  // MICROPHONE (NOW FOR SPEECH RECOGNITION)
+  const toggleMic = () => {
+    if (isListening) {
+      stopListening();
+    } else {
+      startListening();
+    }
+  };
 
+  // Speech Recognition functions
+  const startListening = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Speech Recognition API is not supported in this browser.");
       return;
     }
-    
-    // 2. START recording
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const rec = new MediaRecorder(stream);
-      mediaRef.current = rec;
-      chunksRef.current = [];
-      audioBlobRef.current = null; // Reset audio blob reference
+    if (recognitionRef.current) {
+      recognitionRef.current.start();
+      setIsListening(true);
+    }
+  };
 
-      rec.ondataavailable = (e) => chunksRef.current.push(e.data);
-      
-      rec.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        const url = URL.createObjectURL(blob);
-        audioBlobRef.current = blob; // Store the blob for runCalculation
-
-        // Save to history (locally for playback)
-        const item: HistoryItem = {
-          id: Date.now() + '_aud',
-          type: 'audio',
-          audioUrl: url,
-          audioSent: true, // Mark as sent for processing
-          createdAt: Date.now(),
-        };
-        const newH = [item, ...history];
-        setHistory(newH);
-        try {
-          // Limit history to last 10 items to prevent localStorage quota issues
-          const limitedHistory = newH.slice(0, 10);
-          localStorage.setItem('neuron_history_v1', JSON.stringify(limitedHistory));
-        } catch (error) {
-          console.warn('Failed to save history to localStorage:', error);
-        }
-      };
-      
-      rec.start();
-      setRecording(true);
-    } catch (error) {
-      console.error('Microphone permission denied:', error);
-      alert('Microphone permission denied.');
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
     }
   };
 
@@ -893,7 +926,7 @@ function App() {
     setLoading(true);
 
     try {
-      const payload: any = {
+      const payload: Record<string, unknown> = {
         dict_of_vars: dictOfVars,
         image: imageData,
       };
@@ -973,8 +1006,9 @@ function App() {
 
     // Prefer backend
     try {
-      const payload: any = {
+      const payload: Record<string, unknown> = {
         dict_of_vars: dictOfVars,
+        language_code: selectedLanguage,
       };
       let centerX = 120;
       let centerY = 200;
@@ -1258,7 +1292,7 @@ function App() {
       <Box
         className="w-full h-full"
         style={{
-          background: dark ? '#000' : '#fff',
+          background: dark ? '#e9740eff' : '#fff',
           color: dark ? '#fff' : '#111',
           transition: 'background 200ms ease, color 200ms ease',
           minHeight: '100vh',
@@ -1500,18 +1534,38 @@ function App() {
               onChange={onImageFile}
               style={{ display: 'none' }}
             />
-            <Tooltip label={recording ? 'Stop recording and solve' : 'Start recording'}>
-              <ActionIcon 
-                size="lg" 
-                variant="light" 
-                onClick={toggleMic} 
-                aria-label="Microphone"
-                // Highlight the mic icon when recording
-                color={recording ? 'red' : 'blue'} 
+            <Tooltip label={isListening ? 'Stop listening' : 'Start speech recognition'}>
+              <ActionIcon
+                size="lg"
+                variant="light"
+                onClick={toggleMic}
+                aria-label="Speech Recognition"
+                color={isListening ? 'red' : 'blue'}
+                disabled={loading}
               >
-                <Mic size={24} style={{ color: recording ? '#ef4444' : undefined }} />
+                <Mic size={24} style={{ color: isListening ? '#ef4444' : undefined }} />
               </ActionIcon>
             </Tooltip>
+            <Select
+              placeholder="Language"
+              data={[
+                { value: 'en-US', label: 'English (US)' },
+                { value: 'en-GB', label: 'English (UK)' },
+                { value: 'kn-IN', label: 'Kannada (India)' },
+                { value: 'hi-IN', label: 'Hindi (India)' },
+                { value: 'te-IN', label: 'Telugu (India)' },
+                { value: 'ta-IN', label: 'Tamil (India)' },
+              ]}
+              value={selectedLanguage}
+              onChange={(value) => setSelectedLanguage(value || 'en-US')}
+              style={{ width: 150 }}
+              disabled={loading || isListening}
+              styles={{
+                input: { color: dark ? '#fff' : '#000', backgroundColor: dark ? '#333' : '#fff' },
+                dropdown: { backgroundColor: dark ? '#333' : '#fff' },
+                option: { color: dark ? '#fff' : '#000' },
+              }}
+            />
             <Tooltip label="Upload image">
               <ActionIcon size="lg" variant="light" onClick={onPickImage} aria-label="Upload image">
                 <LucideImage />
@@ -1530,6 +1584,7 @@ function App() {
               Solve
             </MantineButton>
           </Group>
+
           {/* Virtual Math Keyboard */}
           <Group gap="xs" mt={8} style={{ flexWrap: 'wrap', justifyContent: 'center' }}>
             {['+', '-', '×', '÷', '=', '(', ')', '^', '√', 'π', 'e', 'x', 'y', 'z', '<', '>', '≤', '≥', '≠', 'frac', '∫', '∑', 'sin', 'cos', 'tan', 'log', 'ln'].map((key) => (
@@ -1588,7 +1643,7 @@ function App() {
                       color: '#fff',
                       borderRadius: 18,
                       padding: '16px 20px',
-                      boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+                      boxShadow: '0 2px 8px rgba(230, 38, 38, 0.08)',
                       position: 'relative',
                     }}
                   >

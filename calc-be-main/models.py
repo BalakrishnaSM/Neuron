@@ -68,3 +68,11 @@ class History:
     @staticmethod
     def delete_user_history(username):
         history_collection.delete_many({"username": username})
+
+
+
+
+
+
+
+
