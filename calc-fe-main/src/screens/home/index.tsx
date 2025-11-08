@@ -1136,7 +1136,7 @@ function App() {
       
       // Only proceed if we have text or image to send
       if (payload.text || payload.image) {
-          
+
           // --- 4. Backend Call ---
           const response = await axios.post<{data: CalculationResponse[]}>(
             `${API_URL}/calculate`,
@@ -1145,8 +1145,16 @@ function App() {
           );
 
           const resp = response.data;
+          console.log('Backend response:', resp); // Debug log for response
+
           const newVars: Record<string, string> = {};
           const solutions: GeneratedResult[] = [];
+
+          if (!resp.data || !Array.isArray(resp.data)) {
+            console.error('Invalid response data:', resp);
+            alert('Invalid response from server. Please try again.');
+            return;
+          }
 
           resp.data.forEach((r) => {
             if (r.assign) newVars[r.expr] = r.result;
@@ -1157,9 +1165,16 @@ function App() {
             });
           });
 
+          if (solutions.length === 0) {
+            console.warn('No solutions generated from response.');
+            alert('No solutions generated. Please check your input.');
+            return;
+          }
+
           setDictOfVars((prev) => ({ ...prev, ...newVars }));
 
           // Render LaTeX + History
+          console.time('Rendering LaTeX and History'); // Performance logging start
           const newLatex: string[] = [];
           const newPositions: LatexPosition[] = [];
           const newHistory: HistoryItem[] = [];
@@ -1174,14 +1189,20 @@ function App() {
           structuredSteps = structuredSteps.map(step => `• ${step}`);
         }
 
-        // Check if the expression appears to be a math expression
-        const isMath = /[\d+\-*/=xXyYzZ^()]/.test(sol.expression);
+        // For image responses, prefer HTML rendering to avoid slow MathJax
         let latex: string;
-        if (isMath) {
-          latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} \\\\ ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\\\ ${structuredSteps.map(s => escapeHtml(s.replace(/ /g, '~'))).join(' \\\\ ')} \\]`;
-        } else {
-          // For text responses, render as plain HTML to ensure readability in any language
+        if (payload.image) {
+          // Always use HTML for sketch-to-text to improve performance
           latex = `<div style="font-size: 16px; line-height: 1.5; font-family: Arial, sans-serif;"><strong>${escapeHtml(sol.expression)}</strong><br>${escapeHtml(String(sol.answer))}<br>${structuredSteps.map(s => escapeHtml(s)).join('<br>')}</div>`;
+        } else {
+          // Check if the expression appears to be a math expression
+          const isMath = /[\d+\-*/=xXyYzZ^()]/.test(sol.expression);
+          if (isMath) {
+            latex = `\\[\\LARGE ${escapeHtml(sol.expression.replace(/ /g, '~'))} \\\\ ${escapeHtml(String(sol.answer).replace(/ /g, '~'))} \\\\ ${structuredSteps.map(s => escapeHtml(s.replace(/ /g, '~'))).join(' \\\\ ')} \\]`;
+          } else {
+            // For text responses, render as plain HTML to ensure readability in any language
+            latex = `<div style="font-size: 16px; line-height: 1.5; font-family: Arial, sans-serif;"><strong>${escapeHtml(sol.expression)}</strong><br>${escapeHtml(String(sol.answer))}<br>${structuredSteps.map(s => escapeHtml(s)).join('<br>')}</div>`;
+          }
         }
         newLatex.push(latex);
         // Stagger positions with more vertical spacing to avoid overlap
@@ -1210,6 +1231,8 @@ function App() {
           } catch (error) {
             console.warn('Failed to save history to localStorage:', error);
           }
+          console.timeEnd('Rendering LaTeX and History'); // Performance logging end
+          setLoading(false); // Ensure loading is turned off after successful processing
           return;
       }
       
